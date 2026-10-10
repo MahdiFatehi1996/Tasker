@@ -48,6 +48,27 @@ tasker --db "D:\my-tasks.db"
 set TASKER_DB=D:\my-tasks.db & tasker
 ```
 
+### Running on Linux
+
+The codebase is fully portable — no Windows-specific code or dependencies. On a Linux machine:
+
+```sh
+# 1. Toolchain + C compiler (needed to build bundled SQLite)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt install build-essential   # Debian/Ubuntu; or equivalent
+
+# 2. Build and run (crates.io is used directly; no mirror config needed)
+git clone https://github.com/MahdiFatehi1996/Tasker.git
+cd Tasker
+cargo build --release
+./target/release/tasker
+```
+
+Differences from Windows:
+
+- **DB location** resolves to `~/.local/share/tasker/tasks.db` (same `--db` / `TASKER_DB` overrides).
+- **Terminal** needs UTF-8 for the box-drawing and `▌`/`↑` glyphs — any modern terminal emulator qualifies.
+
 ## Step-by-step usage
 
 ### Your first session
