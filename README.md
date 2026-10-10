@@ -162,10 +162,22 @@ docs/agents/     Agent-skill configuration (issue tracker, labels, domain)
 
 ## Developing
 
+Toolchain and code-style config live in the repo:
+
+| File                  | Purpose                                                   |
+| --------------------- | --------------------------------------------------------- |
+| `rust-toolchain.toml` | Pins **stable** + `rustfmt`/`clippy` (rustup; ignored otherwise) |
+| `rustfmt.toml`        | Formatter: edition 2024, LF endings, width 100            |
+| `clippy.toml`         | Linter tuning (MSRV 1.88)                                 |
+| `.editorconfig`       | Editor whitespace/indent defaults                         |
+| `.gitattributes`      | Normalizes text to LF; marks the `.db` file binary        |
+| `Cargo.toml` `[lints]`| `unsafe_code = "forbid"`                                  |
+
 ```sh
-cargo fmt        # format
+cargo fmt                                   # format
+cargo fmt --check                           # format gate
 cargo clippy --all-targets -- -D warnings   # lint gate
-cargo test       # full suite (storage + state-transition seams)
+cargo test                                  # full suite (storage + state-transition seams)
 ```
 
 Work is tracked in [GitHub Issues](https://github.com/MahdiFatehi1996/Tasker/issues). See `AGENTS.md` for the agent workflow.

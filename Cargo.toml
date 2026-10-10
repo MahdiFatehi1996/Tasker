@@ -3,6 +3,9 @@ name = "tasker"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unsafe_code = "forbid"
+
 [dependencies]
 chrono = "0.4.45"
 dirs = "7.0.0"

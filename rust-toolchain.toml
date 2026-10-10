@@ -1,0 +1,7 @@
+# Pin the toolchain (for rustup users) and the components the dev flow needs.
+# A non-rustup installation (e.g. the MSYS2 toolchain on Windows) simply
+# ignores this file.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
