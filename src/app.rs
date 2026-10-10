@@ -7,7 +7,10 @@
 
 use chrono::{Duration, NaiveDate};
 
-use crate::model::{NewTask, Priority, Task, format_due_input, is_blank_title, parse_due_input};
+use crate::model::{
+    NewTask, Priority, Task, format_due_input, format_tags_input, is_blank_title, parse_due_input,
+    parse_tags_input,
+};
 
 /// Input mode: browsing the day list, composing a new task, or editing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,6 +28,7 @@ pub enum EditField {
     Priority,
     Notes,
     Due,
+    Tags,
 }
 
 impl EditField {
@@ -33,16 +37,18 @@ impl EditField {
             EditField::Title => EditField::Priority,
             EditField::Priority => EditField::Notes,
             EditField::Notes => EditField::Due,
-            EditField::Due => EditField::Title,
+            EditField::Due => EditField::Tags,
+            EditField::Tags => EditField::Title,
         }
     }
 
     fn prev(self) -> EditField {
         match self {
-            EditField::Title => EditField::Due,
+            EditField::Title => EditField::Tags,
             EditField::Priority => EditField::Title,
             EditField::Notes => EditField::Priority,
             EditField::Due => EditField::Notes,
+            EditField::Tags => EditField::Due,
         }
     }
 }
@@ -66,6 +72,7 @@ pub struct EditorState {
     priority: Priority,
     notes: String,
     due_text: String,
+    tags_text: String,
     field: EditField,
 }
 
@@ -77,6 +84,7 @@ impl EditorState {
             priority: task.priority,
             notes: task.notes.clone(),
             due_text: task.due.as_ref().map(format_due_input).unwrap_or_default(),
+            tags_text: format_tags_input(&task.tags),
             field: EditField::Title,
         }
     }
@@ -87,11 +95,17 @@ impl EditorState {
         parse_due_input(&self.due_text)
     }
 
+    /// The tags draft parsed (comma-separated, normalized; never fails).
+    fn parsed_tags(&self) -> Vec<String> {
+        parse_tags_input(&self.tags_text)
+    }
+
     fn has_changes(&self) -> bool {
         self.title.trim() != self.original.title
             || self.priority != self.original.priority
             || self.notes != self.original.notes
             || self.parsed_due() != Some(self.original.due)
+            || self.parsed_tags() != self.original.tags
     }
 
     /// Step the focused field; wrapping both directions.
@@ -110,7 +124,7 @@ impl EditorState {
         }
     }
 
-    fn updated_task(&self, due: Option<chrono::NaiveDateTime>) -> Task {
+    fn updated_task(&self, due: Option<chrono::NaiveDateTime>, tags: Vec<String>) -> Task {
         Task {
             id: self.original.id,
             day: self.original.day,
@@ -120,7 +134,7 @@ impl EditorState {
             notes: self.notes.clone(),
             due,
             tracked_secs: self.original.tracked_secs,
-            tags: self.original.tags.clone(),
+            tags,
         }
     }
 
@@ -131,6 +145,11 @@ impl EditorState {
     /// Raw text of the due draft (`YYYY-MM-DD HH:MM`, blank for none).
     pub fn due_text(&self) -> &str {
         &self.due_text
+    }
+
+    /// Raw text of the tags draft (`work, admin`, blank for none).
+    pub fn tags_text(&self) -> &str {
+        &self.tags_text
     }
 
     pub fn priority(&self) -> Priority {
@@ -185,6 +204,11 @@ pub enum Message {
     CancelEdit,
     /// Toggle the in-app keybinding help overlay.
     ToggleHelp,
+    /// Cycle the tag filter to the next tag in use (`f`); wraps around.
+    /// No-op when nothing is tagged.
+    CycleTagFilter,
+    /// Clear the tag filter and restore the full list (`Esc`).
+    ClearTagFilter,
     Quit,
 }
 
@@ -201,7 +225,9 @@ pub enum Effect {
 /// sections — Missed-due (open + due before now), Due-today (open + due
 /// within today), and Overdue (open tasks from past days, still pinned to
 /// their original day). Selection spans the combined list, most urgent
-/// first: missed-due, due-today, overdue, then today.
+/// first: missed-due, due-today, overdue, then today. An optional tag
+/// filter narrows every section to one tag; clearing restores the full
+/// lists, which are always kept intact underneath.
 #[derive(Debug)]
 pub struct App {
     viewed: NaiveDate,
@@ -209,6 +235,8 @@ pub struct App {
     overdue: Vec<Task>,
     due_today: Vec<Task>,
     missed_due: Vec<Task>,
+    tag_filter: Option<String>,
+    all_tags: Vec<String>,
     selected: usize,
     mode: Mode,
     draft: String,
@@ -223,6 +251,7 @@ impl App {
     /// Day list for `viewed`, freshly loaded with its overdue section.
     /// Due sections start empty; the runtime fills them via
     /// [`App::set_due_today`] and [`App::set_missed_due`] after loading.
+    /// The tag filter starts cleared.
     pub fn new(viewed: NaiveDate, tasks: Vec<Task>, overdue: Vec<Task>) -> App {
         let mut app = App {
             viewed,
@@ -231,6 +260,8 @@ impl App {
             overdue: Vec::new(),
             due_today: Vec::new(),
             missed_due: Vec::new(),
+            tag_filter: None,
+            all_tags: Vec::new(),
             selected: 0,
             mode: Mode::Browse,
             draft: String::new(),
@@ -248,23 +279,60 @@ impl App {
         self.viewed
     }
 
-    pub fn tasks(&self) -> &[Task] {
-        &self.tasks
+    /// Active tag filter, if focusing on one tag.
+    pub fn tag_filter(&self) -> Option<&str> {
+        self.tag_filter.as_deref()
     }
 
-    /// Open past-day tasks surfacing in today's view, oldest first.
-    pub fn overdue(&self) -> &[Task] {
-        &self.overdue
+    /// Whether a task passes the active filter (everything passes unfiltered).
+    fn matches_filter(&self, task: &Task) -> bool {
+        match &self.tag_filter {
+            None => true,
+            Some(tag) => task.tags.iter().any(|t| t == tag),
+        }
     }
 
-    /// Open tasks due within today, oldest due first.
-    pub fn due_today(&self) -> &[Task] {
-        &self.due_today
+    /// Raw (unfiltered) rows of one section.
+    fn section_tasks(&self, section: Section) -> &[Task] {
+        match section {
+            Section::MissedDue => &self.missed_due,
+            Section::DueToday => &self.due_today,
+            Section::Overdue => &self.overdue,
+            Section::Today => &self.tasks,
+        }
     }
 
-    /// Open tasks past due, oldest due first.
-    pub fn missed_due(&self) -> &[Task] {
-        &self.missed_due
+    /// Filtered rows of one section, in stored order.
+    fn filtered_in(&self, section: Section) -> Vec<&Task> {
+        self.section_tasks(section)
+            .iter()
+            .filter(|task| self.matches_filter(task))
+            .collect()
+    }
+
+    /// Filtered rows of one section, owned (for rendering).
+    fn visible_in(&self, section: Section) -> Vec<Task> {
+        self.filtered_in(section).into_iter().cloned().collect()
+    }
+
+    /// Visible missed-due rows under the active filter.
+    pub fn visible_missed_due(&self) -> Vec<Task> {
+        self.visible_in(Section::MissedDue)
+    }
+
+    /// Visible due-today rows under the active filter.
+    pub fn visible_due_today(&self) -> Vec<Task> {
+        self.visible_in(Section::DueToday)
+    }
+
+    /// Visible overdue rows under the active filter.
+    pub fn visible_overdue(&self) -> Vec<Task> {
+        self.visible_in(Section::Overdue)
+    }
+
+    /// Visible today rows under the active filter.
+    pub fn visible_tasks(&self) -> Vec<Task> {
+        self.visible_in(Section::Today)
     }
 
     /// Raw cursor over the combined list. Prefer the section cursors
@@ -275,20 +343,39 @@ impl App {
         self.selected
     }
 
-    /// Rows in the combined list (missed-due, due-today, overdue, today).
-    fn combined_len(&self) -> usize {
-        self.missed_due.len() + self.due_today.len() + self.overdue.len() + self.tasks.len()
+    /// Cursor row within a section of the visible (filtered) combined
+    /// list, if that section holds the selection.
+    fn cursor_in(&self, section: Section) -> Option<usize> {
+        match self.split_index(self.selected) {
+            (found, row) if found == section && row < self.filtered_in(section).len() => Some(row),
+            _ => None,
+        }
     }
 
-    /// Split a combined-list index into its section plus row.
+    /// Rows in the visible (filtered) combined list
+    /// (missed-due, due-today, overdue, today).
+    fn combined_len(&self) -> usize {
+        [
+            Section::MissedDue,
+            Section::DueToday,
+            Section::Overdue,
+            Section::Today,
+        ]
+        .into_iter()
+        .map(|section| self.filtered_in(section).len())
+        .sum()
+    }
+
+    /// Split a visible-list index into its section plus visible row.
     fn split_index(&self, index: usize) -> (Section, usize) {
         let mut rest = index;
-        for (section, len) in [
-            (Section::MissedDue, self.missed_due.len()),
-            (Section::DueToday, self.due_today.len()),
-            (Section::Overdue, self.overdue.len()),
-            (Section::Today, self.tasks.len()),
+        for section in [
+            Section::MissedDue,
+            Section::DueToday,
+            Section::Overdue,
+            Section::Today,
         ] {
+            let len = self.filtered_in(section).len();
             if rest < len {
                 return (section, rest);
             }
@@ -299,68 +386,58 @@ impl App {
 
     /// Cursor row within the missed-due section, if it holds the selection.
     pub fn missed_due_cursor(&self) -> Option<usize> {
-        match self.split_index(self.selected) {
-            (Section::MissedDue, row) if row < self.missed_due.len() => Some(row),
-            _ => None,
-        }
+        self.cursor_in(Section::MissedDue)
     }
 
     /// Cursor row within the due-today section, if it holds the selection.
     pub fn due_today_cursor(&self) -> Option<usize> {
-        match self.split_index(self.selected) {
-            (Section::DueToday, row) if row < self.due_today.len() => Some(row),
-            _ => None,
-        }
+        self.cursor_in(Section::DueToday)
     }
 
     /// Cursor row within the overdue section, if it holds the selection.
     pub fn overdue_cursor(&self) -> Option<usize> {
-        match self.split_index(self.selected) {
-            (Section::Overdue, row) if row < self.overdue.len() => Some(row),
-            _ => None,
-        }
+        self.cursor_in(Section::Overdue)
     }
 
     /// Cursor row within today's list, if it holds the selection.
     pub fn today_cursor(&self) -> Option<usize> {
-        match self.split_index(self.selected) {
-            (Section::Today, row) if row < self.tasks.len() => Some(row),
-            _ => None,
-        }
+        self.cursor_in(Section::Today)
     }
 
     fn clamp_selection(&mut self) {
         self.selected = self.selected.min(self.combined_len().saturating_sub(1));
     }
 
-    /// Task under the selection cursor, if the combined list is non-empty.
-    /// Used by detail flows from ticket #6; tests are the first caller.
+    /// Task under the selection cursor, if the visible (filtered) combined
+    /// list is non-empty. Used by detail flows from ticket #6; tests are
+    /// the first caller.
     #[allow(dead_code)]
     pub fn selected_task(&self) -> Option<&Task> {
-        match self.split_index(self.selected) {
-            (Section::MissedDue, row) => self.missed_due.get(row),
-            (Section::DueToday, row) => self.due_today.get(row),
-            (Section::Overdue, row) => self.overdue.get(row),
-            (Section::Today, row) => self.tasks.get(row),
-        }
+        let (section, row) = self.split_index(self.selected);
+        self.filtered_in(section).into_iter().nth(row)
     }
 
     fn selected_task_mut(&mut self) -> Option<&mut Task> {
-        match self.split_index(self.selected) {
-            (Section::MissedDue, row) => self.missed_due.get_mut(row),
-            (Section::DueToday, row) => self.due_today.get_mut(row),
-            (Section::Overdue, row) => self.overdue.get_mut(row),
-            (Section::Today, row) => self.tasks.get_mut(row),
-        }
+        let id = self.selected_task().map(|task| task.id)?;
+        [
+            &mut self.missed_due,
+            &mut self.due_today,
+            &mut self.overdue,
+            &mut self.tasks,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|task| task.id == id)
     }
 
-    /// Mutable text of the focused editor field (title/notes/due); None when
-    /// the editor is closed or the priority field is focused.
+    /// Mutable text of the focused editor field (title/notes/due/tags);
+    /// None when the editor is closed or the priority field is focused.
     fn focused_text_mut(&mut self) -> Option<&mut String> {
         match self.editor.as_mut() {
             Some(editor) if editor.field == EditField::Title => Some(&mut editor.title),
             Some(editor) if editor.field == EditField::Notes => Some(&mut editor.notes),
             Some(editor) if editor.field == EditField::Due => Some(&mut editor.due_text),
+            Some(editor) if editor.field == EditField::Tags => Some(&mut editor.tags_text),
             _ => None,
         }
     }
@@ -423,6 +500,19 @@ impl App {
         self.clamp_selection();
     }
 
+    /// Replace the known tag names (the filter cycle order). A filter
+    /// pointing at a vanished tag clears, so focus mode never strands the
+    /// list on an empty tag.
+    pub fn set_all_tags(&mut self, tags: Vec<String>) {
+        self.all_tags = tags;
+        if let Some(filter) = &self.tag_filter
+            && !self.all_tags.iter().any(|tag| tag == filter)
+        {
+            self.tag_filter = None;
+        }
+        self.clamp_selection();
+    }
+
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.draft.clear();
@@ -451,7 +541,9 @@ impl App {
         if is_blank_title(&editor.title) || !editor.has_changes() {
             return vec![];
         }
-        vec![Effect::Update(editor.updated_task(due))]
+        vec![Effect::Update(
+            editor.updated_task(due, editor.parsed_tags()),
+        )]
     }
     /// Make `day` the viewed day: cursor follows, list reloads via effect.
     fn goto_day(&mut self, day: NaiveDate) -> Vec<Effect> {
@@ -625,6 +717,27 @@ impl App {
                 self.help_open = !self.help_open;
                 vec![]
             }
+            Message::CycleTagFilter => {
+                if self.all_tags.is_empty() {
+                    self.tag_filter = None;
+                } else {
+                    let next = self.tag_filter.as_ref().and_then(|current| {
+                        self.all_tags
+                            .iter()
+                            .skip_while(|tag| *tag != current)
+                            .nth(1)
+                            .cloned()
+                    });
+                    self.tag_filter = Some(next.unwrap_or_else(|| self.all_tags[0].clone()));
+                }
+                self.clamp_selection();
+                vec![]
+            }
+            Message::ClearTagFilter => {
+                self.tag_filter = None;
+                self.clamp_selection();
+                vec![]
+            }
             Message::Quit => {
                 self.should_quit = true;
                 vec![]
@@ -694,12 +807,40 @@ mod tests {
         assert_eq!(app.editor().expect("editor open").field, EditField::Due);
     }
 
+    fn focus_tags(app: &mut App) {
+        for _ in 0..4 {
+            app.update(Message::NextField);
+        }
+        assert_eq!(app.editor().expect("editor open").field, EditField::Tags);
+    }
+
+    fn tagged_task(id: i64, title: &str, tags: &[&str]) -> Task {
+        Task {
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..task(id, title)
+        }
+    }
+
+    fn with_tags() -> App {
+        let mut app = App::new(
+            day(),
+            vec![
+                tagged_task(1, "one", &["work"]),
+                tagged_task(2, "two", &["admin"]),
+                task(3, "three"),
+            ],
+            vec![tagged_task(9, "old", &["work"])],
+        );
+        app.set_all_tags(vec!["admin".to_string(), "work".to_string()]);
+        app
+    }
+
     #[test]
     fn overdue_section_is_exposed_separately() {
         let app = with_overdue();
-        assert_eq!(app.overdue().len(), 1);
-        assert_eq!(app.overdue()[0].title, "old unfinished");
-        assert_eq!(app.tasks().len(), 2);
+        assert_eq!(app.visible_overdue().len(), 1);
+        assert_eq!(app.visible_overdue()[0].title, "old unfinished");
+        assert_eq!(app.visible_tasks().len(), 2);
     }
 
     #[test]
@@ -723,9 +864,9 @@ mod tests {
 
         let effects = app.update(Message::ToggleSelected);
 
-        assert!(app.overdue()[0].done);
+        assert!(app.visible_overdue()[0].done);
         assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0], Effect::Update(app.overdue()[0].clone()));
+        assert_eq!(effects[0], Effect::Update(app.visible_overdue()[0].clone()));
     }
 
     #[test]
@@ -734,9 +875,9 @@ mod tests {
         app.update(Message::ToggleSelected);
 
         app.set_overdue(vec![]);
-        app.set_tasks(app.tasks().to_vec());
+        app.set_tasks(app.visible_tasks());
 
-        assert!(app.overdue().is_empty());
+        assert!(app.visible_overdue().is_empty());
         assert_eq!(app.selected(), 0);
         assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("one"));
     }
@@ -1088,9 +1229,11 @@ mod tests {
         app.update(Message::NextField);
         assert_eq!(app.editor().expect("editor open").field, EditField::Due);
         app.update(Message::NextField);
+        assert_eq!(app.editor().expect("editor open").field, EditField::Tags);
+        app.update(Message::NextField);
         assert_eq!(app.editor().expect("editor open").field, EditField::Title);
         app.update(Message::PrevField);
-        assert_eq!(app.editor().expect("editor open").field, EditField::Due);
+        assert_eq!(app.editor().expect("editor open").field, EditField::Tags);
     }
 
     #[test]
@@ -1217,12 +1360,12 @@ mod tests {
     #[test]
     fn due_sections_are_exposed_separately() {
         let app = with_due_sections();
-        assert_eq!(app.missed_due().len(), 1);
-        assert_eq!(app.missed_due()[0].title, "missed work");
-        assert_eq!(app.due_today().len(), 1);
-        assert_eq!(app.due_today()[0].title, "due work");
-        assert_eq!(app.overdue().len(), 1);
-        assert_eq!(app.tasks().len(), 1);
+        assert_eq!(app.visible_missed_due().len(), 1);
+        assert_eq!(app.visible_missed_due()[0].title, "missed work");
+        assert_eq!(app.visible_due_today().len(), 1);
+        assert_eq!(app.visible_due_today()[0].title, "due work");
+        assert_eq!(app.visible_overdue().len(), 1);
+        assert_eq!(app.visible_tasks().len(), 1);
     }
 
     #[test]
@@ -1255,9 +1398,12 @@ mod tests {
 
         let effects = app.update(Message::ToggleSelected);
 
-        assert!(app.missed_due()[0].done);
+        assert!(app.visible_missed_due()[0].done);
         assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0], Effect::Update(app.missed_due()[0].clone()));
+        assert_eq!(
+            effects[0],
+            Effect::Update(app.visible_missed_due()[0].clone())
+        );
     }
 
     #[test]
@@ -1271,8 +1417,8 @@ mod tests {
         app.set_missed_due(vec![]);
         app.set_due_today(vec![]);
 
-        assert!(app.missed_due().is_empty());
-        assert!(app.due_today().is_empty());
+        assert!(app.visible_missed_due().is_empty());
+        assert!(app.visible_due_today().is_empty());
         assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("one"));
     }
 
@@ -1372,6 +1518,134 @@ mod tests {
         begin_detail(&mut app);
         assert_eq!(app.update(Message::CommitEdit), vec![]);
         assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn begin_edit_shows_tags_draft() {
+        let mut app = with_tags();
+        assert_eq!(app.update(Message::BeginEdit), vec![]);
+        // Selection starts on the overdue "old" task tagged work.
+        assert_eq!(app.editor().expect("editor open").tags_text(), "work");
+    }
+
+    #[test]
+    fn typing_in_tags_field_edits_the_draft() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        focus_tags(&mut app);
+        for c in "work, admin".chars() {
+            app.update(Message::EditChar(c));
+        }
+        assert_eq!(
+            app.editor().expect("editor open").tags_text(),
+            "work, admin"
+        );
+        app.update(Message::EditBackspace);
+        assert_eq!(app.editor().expect("editor open").tags_text(), "work, admi");
+    }
+
+    #[test]
+    fn commit_with_tags_attaches_them_normalized() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        focus_tags(&mut app);
+        for c in " Work ,, ADMIN ".chars() {
+            app.update(Message::EditChar(c));
+        }
+
+        let effects = app.update(Message::CommitEdit);
+
+        assert_eq!(
+            effects,
+            vec![Effect::Update(Task {
+                tags: vec!["admin".to_string(), "work".to_string()],
+                ..task(1, "one")
+            })]
+        );
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn commit_with_blank_tags_clears_them() {
+        let mut app = with_tags();
+        begin_detail(&mut app);
+        focus_tags(&mut app);
+        for _ in 0.."work".len() {
+            app.update(Message::EditBackspace);
+        }
+        assert_eq!(app.editor().expect("editor open").tags_text(), "");
+
+        let effects = app.update(Message::CommitEdit);
+
+        assert_eq!(
+            effects,
+            vec![Effect::Update(Task {
+                tags: Vec::new(),
+                ..tagged_task(9, "old", &["work"])
+            })]
+        );
+    }
+
+    #[test]
+    fn filter_cycles_through_tags_and_wraps() {
+        let mut app = with_tags();
+        assert_eq!(app.tag_filter(), None);
+        assert_eq!(app.update(Message::CycleTagFilter), vec![]);
+        assert_eq!(app.tag_filter(), Some("admin"));
+        assert_eq!(app.update(Message::CycleTagFilter), vec![]);
+        assert_eq!(app.tag_filter(), Some("work"));
+        assert_eq!(app.update(Message::CycleTagFilter), vec![]);
+        assert_eq!(app.tag_filter(), Some("admin"), "cycle wraps around");
+    }
+
+    #[test]
+    fn filter_with_no_tags_is_noop() {
+        let mut app = three_tasks();
+        assert_eq!(app.update(Message::CycleTagFilter), vec![]);
+        assert_eq!(app.tag_filter(), None);
+        assert_eq!(app.update(Message::ClearTagFilter), vec![]);
+        assert_eq!(app.tag_filter(), None);
+    }
+
+    #[test]
+    fn filter_narrows_every_section_and_clear_restores() {
+        let mut app = with_tags();
+        app.update(Message::CycleTagFilter);
+        assert_eq!(app.tag_filter(), Some("admin"));
+
+        assert_eq!(app.visible_tasks().len(), 1);
+        assert_eq!(app.visible_tasks()[0].title, "two");
+        assert!(app.visible_overdue().is_empty());
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("two"));
+
+        assert_eq!(app.update(Message::ClearTagFilter), vec![]);
+        assert_eq!(app.tag_filter(), None);
+        assert_eq!(app.visible_tasks().len(), 3);
+        assert_eq!(app.visible_overdue().len(), 1);
+    }
+
+    #[test]
+    fn filter_clamps_selection_into_view() {
+        let mut app = with_tags();
+        app.update(Message::SelectNext);
+        app.update(Message::SelectNext);
+        app.update(Message::SelectNext);
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("three"));
+
+        app.update(Message::CycleTagFilter);
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("two"));
+    }
+
+    #[test]
+    fn set_all_tags_prunes_a_vanished_filter() {
+        let mut app = with_tags();
+        app.update(Message::CycleTagFilter);
+        app.update(Message::CycleTagFilter);
+        assert_eq!(app.tag_filter(), Some("work"));
+
+        app.set_all_tags(vec!["admin".to_string()]);
+        assert_eq!(app.tag_filter(), None);
+        assert_eq!(app.visible_tasks().len(), 3);
     }
 
     #[test]

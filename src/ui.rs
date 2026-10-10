@@ -81,8 +81,8 @@ fn month_calendar(app: &App, today: NaiveDate) -> Monthly<'_, CalendarEventStore
 const EDITOR_NOTES_VISIBLE: usize = 3;
 
 /// Editor panel height: borders + title + priority + notes label +
-/// visible lines + due row.
-const EDITOR_PANEL_HEIGHT: u16 = 2 + 1 + 1 + 1 + EDITOR_NOTES_VISIBLE as u16 + 1;
+/// visible lines + due row + tags row.
+const EDITOR_PANEL_HEIGHT: u16 = 2 + 1 + 1 + 1 + EDITOR_NOTES_VISIBLE as u16 + 2;
 
 /// Detail editor panel: focused field marked, text caret at the draft end.
 /// Notes show the last few lines so the tail follows typing.
@@ -129,6 +129,13 @@ fn editor_panel(editor: &EditorState) -> Paragraph<'_> {
             with_caret(editor.due_text(), field == EditField::Due)
         )),
     ]));
+    lines.push(Line::from(vec![
+        Span::raw(marker(field == EditField::Tags)),
+        Span::raw(format!(
+            "Tags: {}",
+            with_caret(editor.tags_text(), field == EditField::Tags)
+        )),
+    ]));
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Edit"))
 }
 
@@ -166,11 +173,35 @@ fn task_row(task: &Task, selected: bool, flag: Option<String>) -> ListItem<'_> {
     ListItem::new(Line::from(spans))
 }
 
+/// Append `#tags` to a section flag so filtered rows show why they
+/// matched; untagged tasks keep the bare flag.
+fn with_tags(base: String, tags: &[String]) -> String {
+    if tags.is_empty() {
+        base
+    } else {
+        format!("{base} #{}", tags.join(" #"))
+    }
+}
+
+/// Flag rendering a task's day pin in the overdue section.
+fn day_flag(task: &Task) -> String {
+    with_tags(task.day.format("%Y-%m-%d").to_string(), &task.tags)
+}
+
 /// Flag rendering a task's due moment in the due sections,
 /// mirroring the overdue `[YYYY-MM-DD]` pin flag.
 fn due_flag(task: &Task) -> Option<String> {
     task.due
-        .map(|due| format!("due {}", format_due_input(&due)))
+        .map(|due| with_tags(format!("due {}", format_due_input(&due)), &task.tags))
+}
+
+/// Flag rendering a task's tags on the day list (no day/due pin there).
+fn tags_flag(task: &Task) -> Option<String> {
+    if task.tags.is_empty() {
+        None
+    } else {
+        Some(format!("#{}", task.tags.join(" #")))
+    }
 }
 
 /// Draw one frame: calendar pane left, day-list column right
@@ -198,15 +229,22 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         outer[0],
     );
 
+    // Visible rows under the active tag filter; every section below
+    // renders these, so focus mode narrows the whole column at once.
+    let missed = app.visible_missed_due();
+    let due_today = app.visible_due_today();
+    let overdue = app.visible_overdue();
+    let tasks = app.visible_tasks();
+
     let mut constraints = Vec::new();
-    if !app.missed_due().is_empty() {
-        constraints.push(Constraint::Length(app.missed_due().len() as u16 + 2));
+    if !missed.is_empty() {
+        constraints.push(Constraint::Length(missed.len() as u16 + 2));
     }
-    if !app.due_today().is_empty() {
-        constraints.push(Constraint::Length(app.due_today().len() as u16 + 2));
+    if !due_today.is_empty() {
+        constraints.push(Constraint::Length(due_today.len() as u16 + 2));
     }
-    if !app.overdue().is_empty() {
-        constraints.push(Constraint::Length(app.overdue().len() as u16 + 2));
+    if !overdue.is_empty() {
+        constraints.push(Constraint::Length(overdue.len() as u16 + 2));
     }
     constraints.push(Constraint::Min(1));
     if app.mode() == Mode::Detail {
@@ -219,10 +257,9 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         .split(outer[1]);
 
     let mut section = 0;
-    if !app.missed_due().is_empty() {
+    if !missed.is_empty() {
         let cursor = app.missed_due_cursor();
-        let items: Vec<ListItem> = app
-            .missed_due()
+        let items: Vec<ListItem> = missed
             .iter()
             .enumerate()
             .map(|(i, task)| task_row(task, Some(i) == cursor, due_flag(task)))
@@ -234,10 +271,9 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         frame.render_stateful_widget(list, chunks[section], &mut state);
         section += 1;
     }
-    if !app.due_today().is_empty() {
+    if !due_today.is_empty() {
         let cursor = app.due_today_cursor();
-        let items: Vec<ListItem> = app
-            .due_today()
+        let items: Vec<ListItem> = due_today
             .iter()
             .enumerate()
             .map(|(i, task)| task_row(task, Some(i) == cursor, due_flag(task)))
@@ -249,19 +285,12 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         frame.render_stateful_widget(list, chunks[section], &mut state);
         section += 1;
     }
-    if !app.overdue().is_empty() {
+    if !overdue.is_empty() {
         let cursor = app.overdue_cursor();
-        let items: Vec<ListItem> = app
-            .overdue()
+        let items: Vec<ListItem> = overdue
             .iter()
             .enumerate()
-            .map(|(i, task)| {
-                task_row(
-                    task,
-                    Some(i) == cursor,
-                    Some(task.day.format("%Y-%m-%d").to_string()),
-                )
-            })
+            .map(|(i, task)| task_row(task, Some(i) == cursor, Some(day_flag(task))))
             .collect();
         let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Overdue"));
         let mut state = ListState::default();
@@ -271,11 +300,10 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
     }
 
     let cursor = app.today_cursor();
-    let items: Vec<ListItem> = app
-        .tasks()
+    let items: Vec<ListItem> = tasks
         .iter()
         .enumerate()
-        .map(|(i, task)| task_row(task, Some(i) == cursor, None))
+        .map(|(i, task)| task_row(task, Some(i) == cursor, tags_flag(task)))
         .collect();
 
     let title = format!("Tasker — {}", app.viewed().format("%a %b %d, %Y"));
@@ -305,18 +333,20 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
             Line::raw("Enter commit · Esc cancel"),
         ),
         Mode::Browse => {
-            let visible: Vec<&Task> = app
-                .missed_due()
+            let total = missed.len() + due_today.len() + overdue.len() + tasks.len();
+            let done = [&missed, &due_today, &overdue, &tasks]
                 .iter()
-                .chain(app.due_today())
-                .chain(app.overdue())
-                .chain(app.tasks())
-                .collect();
-            let done = visible.iter().filter(|task| task.done).count();
+                .flat_map(|section| section.iter())
+                .filter(|task| task.done)
+                .count();
+            let status = match app.tag_filter() {
+                Some(tag) => format!("[#{tag}] {done}/{total} done"),
+                None => format!("{done}/{total} done"),
+            };
             (
-                Line::raw(format!("{}/{} done", done, visible.len())),
+                Line::raw(status),
                 Line::raw(
-                    "j/k move · x toggle · a add · e edit · [ ] day · t today · Tab cal · ? help · q quit",
+                    "j/k move · x toggle · a add · e edit · f filter · [ ] day · t today · Tab cal · ? help · q quit",
                 ),
             )
         }
@@ -369,6 +399,8 @@ fn help_text() -> Vec<Line<'static>> {
         Line::raw("  x, Space      toggle done"),
         Line::raw("  a             add task"),
         Line::raw("  e, Enter      edit task"),
+        Line::raw("  f             cycle tag filter"),
+        Line::raw("  Esc           clear tag filter"),
         Line::raw("  Tab           focus calendar"),
         Line::raw("  q             quit"),
         Line::raw(""),
@@ -388,6 +420,7 @@ fn help_text() -> Vec<Line<'static>> {
         Line::raw("  Tab / Shift+Tab  switch field"),
         Line::raw("  Left/Right, Space cycle priority"),
         Line::raw("  Due: YYYY-MM-DD HH:MM, blank clears"),
+        Line::raw("  Tags: a, b, c (blank clears)"),
         Line::raw("  type, Backspace  edit field"),
         Line::raw("  Enter            commit (newline in notes)"),
         Line::raw("  Ctrl+S           save"),
@@ -445,6 +478,8 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
                 KeyCode::Char('x') | KeyCode::Char(' ') => Some(Message::ToggleSelected),
                 KeyCode::Char('a') => Some(Message::BeginAdd),
                 KeyCode::Char('e') | KeyCode::Enter => Some(Message::BeginEdit),
+                KeyCode::Char('f') => Some(Message::CycleTagFilter),
+                KeyCode::Esc => Some(Message::ClearTagFilter),
                 KeyCode::Tab => Some(Message::FocusCalendar),
                 _ => None,
             },
@@ -524,6 +559,9 @@ fn event_loop(
             app.set_due_today(db.due_today_tasks(today)?);
             let now = Local::now().naive_local();
             app.set_missed_due(db.missed_due_tasks(now)?);
+            // Tag names feed the `f` filter cycle; a filter pointing at a
+            // vanished tag clears inside the setter.
+            app.set_all_tags(db.all_tags()?);
         }
         if app.should_quit() {
             break;
@@ -599,6 +637,14 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char('e')), Mode::Browse, false, today),
             Some(Message::BeginEdit)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('f')), Mode::Browse, false, today),
+            Some(Message::CycleTagFilter)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Esc), Mode::Browse, false, today),
+            Some(Message::ClearTagFilter)
         );
         assert_eq!(
             map_key(press(KeyCode::Char('?')), Mode::Browse, false, today),

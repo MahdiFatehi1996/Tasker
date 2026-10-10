@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let missed = database.missed_due_tasks(now)?;
     notify_missed_due(&missed);
     app.set_missed_due(missed);
+    app.set_all_tags(database.all_tags()?);
     ui::run(&database, &mut app)?;
     Ok(())
 }

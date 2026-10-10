@@ -130,6 +130,21 @@ pub fn normalize_tags(names: &[String]) -> Vec<String> {
     out
 }
 
+/// Render attached tags for the editor draft (`work, admin`).
+pub fn format_tags_input(tags: &[String]) -> String {
+    tags.join(", ")
+}
+
+/// Parse an editor tags draft: comma-separated, normalized like stored
+/// tags. Blank clears all tags; never fails, so any text commits.
+pub fn parse_tags_input(s: &str) -> Vec<String> {
+    normalize_tags(
+        &s.split(',')
+            .map(|part| part.to_string())
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Titles that are empty or whitespace-only can never be committed —
 /// shared by add commits and edit commits so the rule lives once.
 pub fn is_blank_title(title: &str) -> bool {
@@ -199,5 +214,21 @@ mod tests {
         assert_eq!(parse_due_input("soon"), None);
         assert_eq!(parse_due_input("2026-13-10 12:30"), None);
         assert_eq!(parse_due_input("12:30"), None);
+    }
+
+    #[test]
+    fn tags_input_round_trip() {
+        let tags = vec!["admin".to_string(), "work".to_string()];
+        assert_eq!(format_tags_input(&tags), "admin, work");
+        assert_eq!(parse_tags_input("admin, work"), tags);
+    }
+
+    #[test]
+    fn tags_input_normalizes_and_blank_clears() {
+        assert_eq!(
+            parse_tags_input(" Work ,, ADMIN,work "),
+            vec!["admin".to_string(), "work".to_string()]
+        );
+        assert_eq!(parse_tags_input("  "), Vec::<String>::new());
     }
 }

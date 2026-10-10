@@ -437,6 +437,15 @@ impl Database {
         )
     }
 
+    /// Every tag name in use, sorted ascending: the tag-filter cycle order.
+    /// Wired into user flows by Pro P3; tests are the first caller.
+    #[allow(dead_code)]
+    pub fn all_tags(&self) -> Result<Vec<String>, Error> {
+        let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(names.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Add (or subtract, clamped at zero) tracked seconds for a task.
     /// Survives restarts: the total lives in the tasks row.
     /// Wired into user flows by Pro P4; tests are the first caller.
@@ -1023,6 +1032,25 @@ mod tests {
         db.remove_tag(other, "work").expect("detach other");
         assert!(db.tags_for_task(id).expect("list tags").is_empty());
         assert_eq!(db.tasks_for_day(day).expect("day list").len(), 2);
+    }
+
+    #[test]
+    fn all_tags_lists_names_in_use_sorted() {
+        let db = memory_db();
+        assert!(db.all_tags().expect("list tags").is_empty());
+        let id = db.save_task(&sample_task()).expect("save task");
+        db.add_tag(id, "work").expect("attach work");
+        db.add_tag(id, "Admin").expect("attach admin");
+        assert_eq!(
+            db.all_tags().expect("list tags"),
+            vec!["admin".to_string(), "work".to_string()]
+        );
+        db.remove_tag(id, "admin").expect("detach admin");
+        db.remove_tag(id, "work").expect("detach work");
+        assert!(
+            db.all_tags().expect("list tags").is_empty(),
+            "orphaned names leave the cycle order"
+        );
     }
 
     #[test]
