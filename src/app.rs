@@ -96,6 +96,9 @@ impl EditorState {
             done: self.original.done,
             priority: self.priority,
             notes: self.notes.clone(),
+            due: self.original.due,
+            tracked_secs: self.original.tracked_secs,
+            tags: self.original.tags.clone(),
         }
     }
 
@@ -425,6 +428,8 @@ impl App {
                         title,
                         priority: Priority::Medium,
                         notes: String::new(),
+                        due: None,
+                        tags: Vec::new(),
                     })]
                 }
             }
@@ -552,6 +557,9 @@ mod tests {
             done: false,
             priority: Priority::Medium,
             notes: String::new(),
+            due: None,
+            tracked_secs: 0,
+            tags: Vec::new(),
         }
     }
 
@@ -726,6 +734,8 @@ mod tests {
                 title: "buy milk".to_string(),
                 priority: Priority::Medium,
                 notes: String::new(),
+                due: None,
+                tags: Vec::new(),
             })]
         );
         assert_eq!(app.mode(), Mode::Browse);
@@ -897,6 +907,8 @@ mod tests {
                 title: "past work".to_string(),
                 priority: Priority::Medium,
                 notes: String::new(),
+                due: None,
+                tags: Vec::new(),
             })]
         );
     }
@@ -1063,6 +1075,9 @@ mod tests {
                 done: false,
                 priority: Priority::High,
                 notes: "some notes".to_string(),
+                due: None,
+                tracked_secs: 0,
+                tags: Vec::new(),
             })]
         );
         assert_eq!(app.mode(), Mode::Browse);

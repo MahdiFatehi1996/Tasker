@@ -1,10 +1,12 @@
 //! Domain types: the Tasker glossary as code.
 //!
-//! A [`Task`] is a title plus state (open/done), a [`Priority`], and one
-//! free-text note body, pinned to a calendar day. Overdue is derived state
-//! (open + day before today), never stored.
+//! A [`Task`] is a title plus state (open/done), a [`Priority`], one
+//! free-text note body, an optional due date-time, accumulated tracked
+//! seconds, and attached tags — pinned to a calendar day. Overdue is derived
+//! state (open + day before today), never stored. Due-today and missed-due
+//! are likewise derived from the due moment, never stored.
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 
 /// Priority of a task: low, medium, or high. Defaults to medium.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -63,6 +65,12 @@ pub struct Task {
     pub done: bool,
     pub priority: Priority,
     pub notes: String,
+    /// Optional exact due date-time (Pro). `None` means no deadline.
+    pub due: Option<NaiveDateTime>,
+    /// Accumulated tracked seconds (Pro timer). Never negative.
+    pub tracked_secs: i64,
+    /// Attached tags, sorted ascending (Pro). Empty means untagged.
+    pub tags: Vec<String>,
 }
 
 impl Task {
@@ -73,7 +81,7 @@ impl Task {
     }
 }
 
-/// A task not yet stored: everything except id and done state.
+/// A task not yet stored: everything except id, done state, and timer total.
 /// Constructed by add-flows from ticket #3; tests are the first caller.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +90,44 @@ pub struct NewTask {
     pub title: String,
     pub priority: Priority,
     pub notes: String,
+    /// Optional exact due date-time (Pro). `None` means no deadline.
+    pub due: Option<NaiveDateTime>,
+    /// Attached tags (Pro). Stored normalized (trimmed, lowercase).
+    pub tags: Vec<String>,
+}
+
+impl NewTask {
+    /// Minimal new task pinned to `day` with a title: medium priority,
+    /// no notes, no due moment, no tags. Timer starts at zero on save.
+    #[allow(dead_code)]
+    pub fn dated(day: NaiveDate, title: String) -> NewTask {
+        NewTask {
+            day,
+            title,
+            priority: Priority::Medium,
+            notes: String::new(),
+            due: None,
+            tags: Vec::new(),
+        }
+    }
+}
+
+/// Normalize a tag name: trim + lowercase. Blank names are rejected.
+pub fn normalize_tag(name: &str) -> Option<String> {
+    let cleaned = name.trim().to_ascii_lowercase();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Normalize a tag list: normalize each, drop blanks, sort, dedupe.
+pub fn normalize_tags(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = names.iter().filter_map(|n| normalize_tag(n)).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Titles that are empty or whitespace-only can never be committed —
