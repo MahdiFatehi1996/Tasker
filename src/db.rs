@@ -95,6 +95,19 @@ fn parse_priority(s: &str) -> rusqlite::Result<Priority> {
     })
 }
 
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    let day_text: String = row.get(1)?;
+    let priority_text: String = row.get(4)?;
+    Ok(Task {
+        id: row.get(0)?,
+        day: parse_day(&day_text)?,
+        title: row.get(2)?,
+        done: row.get::<_, i64>(3)? != 0,
+        priority: parse_priority(&priority_text)?,
+        notes: row.get(5)?,
+    })
+}
+
 #[derive(Debug)]
 struct UnknownPriority(String);
 
@@ -169,16 +182,21 @@ impl Database {
             "SELECT id, day, title, done, priority, notes FROM tasks WHERE day = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([day.format(DAY_FORMAT).to_string()], |row| {
-            let day_text: String = row.get(1)?;
-            let priority_text: String = row.get(4)?;
-            Ok(Task {
-                id: row.get(0)?,
-                day: parse_day(&day_text)?,
-                title: row.get(2)?,
-                done: row.get::<_, i64>(3)? != 0,
-                priority: parse_priority(&priority_text)?,
-                notes: row.get(5)?,
-            })
+            task_from_row(row)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::Sql)
+    }
+
+    /// Open tasks from days before `today`, oldest first: the Overdue
+    /// section. Done tasks and today/future tasks are never overdue.
+    /// Day pins never change — overdue is derived, not re-dated.
+    pub fn overdue_tasks(&self, today: NaiveDate) -> Result<Vec<Task>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, day, title, done, priority, notes FROM tasks WHERE day < ?1 AND done = 0 ORDER BY day, id",
+        )?;
+        let rows = stmt.query_map([today.format(DAY_FORMAT).to_string()], |row| {
+            task_from_row(row)
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Error::Sql)
@@ -328,6 +346,88 @@ mod tests {
         assert!(tasks[0].done, "toggled state survives a restart");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn overdue_returns_only_open_past_tasks() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let past = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        let today = NaiveDate::from_ymd_opt(2026, 10, 10).expect("valid date");
+        let future = NaiveDate::from_ymd_opt(2026, 10, 12).expect("valid date");
+
+        let overdue_id = db
+            .save_task(&NewTask {
+                day: past,
+                title: "Unfinished past work".to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+            })
+            .expect("save past open task");
+        let done_id = db
+            .save_task(&NewTask {
+                day: past,
+                title: "Finished past work".to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+            })
+            .expect("save past task to complete");
+        db.update_task(&Task {
+            id: done_id,
+            day: past,
+            title: "Finished past work".to_string(),
+            done: true,
+            priority: Priority::Medium,
+            notes: String::new(),
+        })
+        .expect("complete past task");
+        db.save_task(&NewTask {
+            day: today,
+            title: "Today work".to_string(),
+            priority: Priority::Medium,
+            notes: String::new(),
+        })
+        .expect("save today task");
+        db.save_task(&NewTask {
+            day: future,
+            title: "Future work".to_string(),
+            priority: Priority::Medium,
+            notes: String::new(),
+        })
+        .expect("save future task");
+
+        let overdue = db.overdue_tasks(today).expect("query overdue");
+        assert_eq!(overdue.len(), 1);
+        assert_eq!(overdue[0].id, overdue_id);
+        assert_eq!(overdue[0].title, "Unfinished past work");
+        assert_eq!(overdue[0].day, past, "overdue keeps its original day");
+    }
+
+    #[test]
+    fn completed_task_leaves_overdue() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let past = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        let today = NaiveDate::from_ymd_opt(2026, 10, 10).expect("valid date");
+        let id = db
+            .save_task(&NewTask {
+                day: past,
+                title: "Past work".to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+            })
+            .expect("save past open task");
+        assert_eq!(db.overdue_tasks(today).expect("query overdue").len(), 1);
+
+        let mut tasks = db.tasks_for_day(past).expect("query past day");
+        tasks[0].done = true;
+        db.update_task(&tasks[0]).expect("complete past task");
+        assert_eq!(id, tasks[0].id);
+
+        assert!(
+            db.overdue_tasks(today)
+                .expect("query overdue after completion")
+                .is_empty(),
+            "completing a task removes it from Overdue"
+        );
     }
 
     #[test]

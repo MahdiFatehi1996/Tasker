@@ -33,7 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = resolve_db_path(parse_db_arg(&args));
     let database = Database::open(&path)?;
     let today = Local::now().date_naive();
-    let mut app = App::new(today, database.tasks_for_day(today)?);
+    let mut app = App::new(
+        today,
+        database.tasks_for_day(today)?,
+        database.overdue_tasks(today)?,
+    );
     ui::run(&database, &mut app)?;
     Ok(())
 }

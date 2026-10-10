@@ -38,11 +38,14 @@ pub enum Effect {
     Update(Task),
 }
 
-/// In-memory state of the day-list view.
+/// In-memory state of the day-list view: today's tasks plus the
+/// Overdue section (open tasks from past days, still pinned to their
+/// original day). Selection spans the combined list, overdue first.
 #[derive(Debug)]
 pub struct App {
     viewed: NaiveDate,
     tasks: Vec<Task>,
+    overdue: Vec<Task>,
     selected: usize,
     mode: Mode,
     draft: String,
@@ -50,17 +53,19 @@ pub struct App {
 }
 
 impl App {
-    /// Day list for `viewed`, freshly loaded.
-    pub fn new(viewed: NaiveDate, tasks: Vec<Task>) -> App {
+    /// Day list for `viewed`, freshly loaded with its overdue section.
+    pub fn new(viewed: NaiveDate, tasks: Vec<Task>, overdue: Vec<Task>) -> App {
         let mut app = App {
             viewed,
             tasks: Vec::new(),
+            overdue: Vec::new(),
             selected: 0,
             mode: Mode::Browse,
             draft: String::new(),
             should_quit: false,
         };
         app.set_tasks(tasks);
+        app.set_overdue(overdue);
         app
     }
 
@@ -72,15 +77,69 @@ impl App {
         &self.tasks
     }
 
+    /// Open past-day tasks surfacing in today's view, oldest first.
+    pub fn overdue(&self) -> &[Task] {
+        &self.overdue
+    }
+
+    /// Raw cursor over the combined list. Prefer the section cursors
+    /// ([`App::overdue_cursor`], [`App::today_cursor`]) in new code;
+    /// kept for tests asserting wrap-around positions.
+    #[allow(dead_code)]
     pub fn selected(&self) -> usize {
         self.selected
     }
 
-    /// Task under the selection cursor, if the list is non-empty.
+    /// Rows in the combined list (overdue first, then today).
+    fn combined_len(&self) -> usize {
+        self.overdue.len() + self.tasks.len()
+    }
+
+    /// Split a combined-list index into its section: `true` + row means an
+    /// overdue row, `false` + row means a today row.
+    fn split_index(&self, index: usize) -> (bool, usize) {
+        if index < self.overdue.len() {
+            (true, index)
+        } else {
+            (false, index - self.overdue.len())
+        }
+    }
+
+    /// Cursor row within the overdue section, if it holds the selection.
+    pub fn overdue_cursor(&self) -> Option<usize> {
+        match self.split_index(self.selected) {
+            (true, row) if row < self.overdue.len() => Some(row),
+            _ => None,
+        }
+    }
+
+    /// Cursor row within today's list, if it holds the selection.
+    pub fn today_cursor(&self) -> Option<usize> {
+        match self.split_index(self.selected) {
+            (false, row) if row < self.tasks.len() => Some(row),
+            _ => None,
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        self.selected = self.selected.min(self.combined_len().saturating_sub(1));
+    }
+
+    /// Task under the selection cursor, if the combined list is non-empty.
     /// Used by detail flows from ticket #6; tests are the first caller.
     #[allow(dead_code)]
     pub fn selected_task(&self) -> Option<&Task> {
-        self.tasks.get(self.selected)
+        match self.split_index(self.selected) {
+            (true, row) => self.overdue.get(row),
+            (false, row) => self.tasks.get(row),
+        }
+    }
+
+    fn selected_task_mut(&mut self) -> Option<&mut Task> {
+        match self.split_index(self.selected) {
+            (true, row) => self.overdue.get_mut(row),
+            (false, row) => self.tasks.get_mut(row),
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -95,11 +154,18 @@ impl App {
         self.should_quit
     }
 
-    /// Replace the task list (e.g. after reloading from storage),
-    /// keeping the selection on a valid row.
+    /// Replace today's task list (e.g. after reloading from storage),
+    /// keeping the selection on a valid row of the combined list.
     pub fn set_tasks(&mut self, tasks: Vec<Task>) {
         self.tasks = tasks;
-        self.selected = self.selected.min(self.tasks.len().saturating_sub(1));
+        self.clamp_selection();
+    }
+
+    /// Replace the overdue section (e.g. after reloading from storage),
+    /// keeping the selection on a valid row of the combined list.
+    pub fn set_overdue(&mut self, overdue: Vec<Task>) {
+        self.overdue = overdue;
+        self.clamp_selection();
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -108,10 +174,10 @@ impl App {
     }
 
     fn move_selection(&mut self, step: isize) {
-        if self.tasks.is_empty() {
+        if self.combined_len() == 0 {
             return;
         }
-        let len = self.tasks.len() as isize;
+        let len = self.combined_len() as isize;
         self.selected = (self.selected as isize + step).rem_euclid(len) as usize;
     }
 
@@ -127,7 +193,7 @@ impl App {
                 self.move_selection(-1);
                 vec![]
             }
-            Message::ToggleSelected => match self.tasks.get_mut(self.selected) {
+            Message::ToggleSelected => match self.selected_task_mut() {
                 Some(task) => {
                     task.toggle();
                     vec![Effect::Update(task.clone())]
@@ -199,7 +265,74 @@ mod tests {
         App::new(
             day(),
             vec![task(1, "one"), task(2, "two"), task(3, "three")],
+            vec![],
         )
+    }
+
+    fn with_overdue() -> App {
+        let mut old = task(9, "old unfinished");
+        old.day = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        App::new(day(), vec![task(1, "one"), task(2, "two")], vec![old])
+    }
+
+    #[test]
+    fn overdue_section_is_exposed_separately() {
+        let app = with_overdue();
+        assert_eq!(app.overdue().len(), 1);
+        assert_eq!(app.overdue()[0].title, "old unfinished");
+        assert_eq!(app.tasks().len(), 2);
+    }
+
+    #[test]
+    fn selection_spans_the_combined_list() {
+        let mut app = with_overdue();
+        assert_eq!(app.selected(), 0);
+        assert_eq!(
+            app.selected_task().map(|t| t.title.as_str()),
+            Some("old unfinished")
+        );
+        app.update(Message::SelectNext);
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("one"));
+        app.update(Message::SelectNext);
+        app.update(Message::SelectNext);
+        assert_eq!(app.selected(), 0, "selection wraps the combined list");
+    }
+
+    #[test]
+    fn toggle_overdue_task_flips_and_emits_update() {
+        let mut app = with_overdue();
+
+        let effects = app.update(Message::ToggleSelected);
+
+        assert!(app.overdue()[0].done);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0], Effect::Update(app.overdue()[0].clone()));
+    }
+
+    #[test]
+    fn completing_overdue_then_reloading_clears_the_section() {
+        let mut app = with_overdue();
+        app.update(Message::ToggleSelected);
+
+        app.set_overdue(vec![]);
+        app.set_tasks(app.tasks().to_vec());
+
+        assert!(app.overdue().is_empty());
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("one"));
+    }
+
+    #[test]
+    fn set_overdue_clamps_selection() {
+        let mut app = with_overdue();
+        app.update(Message::SelectNext);
+        app.update(Message::SelectNext);
+        assert_eq!(app.selected(), 2);
+
+        app.set_tasks(vec![]);
+        app.set_overdue(vec![]);
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.selected_task(), None);
     }
 
     #[test]
@@ -222,7 +355,7 @@ mod tests {
 
     #[test]
     fn select_on_empty_list_is_noop() {
-        let mut app = App::new(day(), vec![]);
+        let mut app = App::new(day(), vec![], vec![]);
         assert_eq!(app.update(Message::SelectNext), vec![]);
         assert_eq!(app.update(Message::SelectPrev), vec![]);
         assert_eq!(app.selected(), 0);
@@ -251,7 +384,7 @@ mod tests {
 
     #[test]
     fn toggle_on_empty_list_emits_nothing() {
-        let mut app = App::new(day(), vec![]);
+        let mut app = App::new(day(), vec![], vec![]);
         assert_eq!(app.update(Message::ToggleSelected), vec![]);
     }
 

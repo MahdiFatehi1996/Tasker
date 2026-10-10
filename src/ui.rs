@@ -15,7 +15,7 @@ use ratatui::{
 
 use crate::app::{App, Effect, Message, Mode};
 use crate::db::Database;
-use crate::model::Priority;
+use crate::model::{Priority, Task};
 
 fn priority_letter(priority: Priority) -> char {
     match priority {
@@ -25,41 +25,80 @@ fn priority_letter(priority: Priority) -> char {
     }
 }
 
-/// Draw one frame of the day-list view.
+/// One task row. `selected` drives the cursor marker; `original_day` (the
+/// pin of an overdue task) renders after the checkbox when present.
+fn task_row(task: &Task, selected: bool, original_day: Option<String>) -> ListItem<'_> {
+    let marker = if selected { "> " } else { "  " };
+    let checkbox = if task.done { "[x]" } else { "[ ]" };
+    let row_style = if task.done {
+        Style::default().add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![
+        Span::styled(marker, row_style),
+        Span::styled(format!("{} ", checkbox), row_style),
+    ];
+    if let Some(flag) = original_day {
+        spans.push(Span::styled(format!("[{}] ", flag), row_style));
+    }
+    spans.push(Span::styled(
+        format!("[{}] {}", priority_letter(task.priority), task.title),
+        row_style,
+    ));
+    ListItem::new(Line::from(spans))
+}
+
+/// Draw one frame of the day-list view: the Overdue section (when non-empty)
+/// above today's list, then the status footer.
 fn render(frame: &mut Frame, app: &App) {
+    let mut constraints = Vec::new();
+    if !app.overdue().is_empty() {
+        constraints.push(Constraint::Length(app.overdue().len() as u16 + 2));
+    }
+    constraints.push(Constraint::Min(1));
+    constraints.push(Constraint::Length(2));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints(constraints)
         .split(frame.area());
 
+    let mut section = 0;
+    if !app.overdue().is_empty() {
+        let cursor = app.overdue_cursor();
+        let items: Vec<ListItem> = app
+            .overdue()
+            .iter()
+            .enumerate()
+            .map(|(i, task)| {
+                task_row(
+                    task,
+                    Some(i) == cursor,
+                    Some(task.day.format("%Y-%m-%d").to_string()),
+                )
+            })
+            .collect();
+        let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Overdue"));
+        let mut state = ListState::default();
+        state.select(cursor);
+        frame.render_stateful_widget(list, chunks[section], &mut state);
+        section += 1;
+    }
+
+    let cursor = app.today_cursor();
     let items: Vec<ListItem> = app
         .tasks()
         .iter()
         .enumerate()
-        .map(|(i, task)| {
-            let marker = if i == app.selected() { "> " } else { "  " };
-            let checkbox = if task.done { "[x]" } else { "[ ]" };
-            let row_style = if task.done {
-                Style::default().add_modifier(Modifier::CROSSED_OUT)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(marker, row_style),
-                Span::styled(format!("{} ", checkbox), row_style),
-                Span::styled(
-                    format!("[{}] {}", priority_letter(task.priority), task.title),
-                    row_style,
-                ),
-            ]))
-        })
+        .map(|(i, task)| task_row(task, Some(i) == cursor, None))
         .collect();
 
     let title = format!("Tasker — {}", app.viewed().format("%a %b %d, %Y"));
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     let mut state = ListState::default();
-    state.select(Some(app.selected()));
-    frame.render_stateful_widget(list, chunks[0], &mut state);
+    state.select(cursor);
+    frame.render_stateful_widget(list, chunks[section], &mut state);
+    section += 1;
 
     let (status, help) = match app.mode() {
         Mode::Adding => (
@@ -74,14 +113,15 @@ fn render(frame: &mut Frame, app: &App) {
             Line::raw("Enter commit · Esc cancel"),
         ),
         Mode::Browse => {
-            let done = app.tasks().iter().filter(|task| task.done).count();
+            let visible: Vec<&Task> = app.overdue().iter().chain(app.tasks()).collect();
+            let done = visible.iter().filter(|task| task.done).count();
             (
-                Line::raw(format!("{}/{} done", done, app.tasks().len())),
+                Line::raw(format!("{}/{} done", done, visible.len())),
                 Line::raw("j/k move · x toggle · a add · q quit"),
             )
         }
     };
-    frame.render_widget(Paragraph::new(vec![status, help]), chunks[1]);
+    frame.render_widget(Paragraph::new(vec![status, help]), chunks[section]);
 }
 
 /// Block until a key maps to a message for the current mode.
@@ -143,6 +183,11 @@ fn event_loop(
                 }
             }
             app.set_tasks(db.tasks_for_day(app.viewed())?);
+            // Overdue is anchored to real today, never to the viewed day:
+            // browsing a past day must not hide it, and a future day must
+            // not promote today's tasks into it.
+            let today = chrono::Local::now().date_naive();
+            app.set_overdue(db.overdue_tasks(today)?);
         }
         if app.should_quit() {
             break;
