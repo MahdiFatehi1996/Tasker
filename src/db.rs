@@ -344,8 +344,9 @@ mod tests {
         let tasks = db.tasks_for_day(day).expect("query day after reopen");
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].done, "toggled state survives a restart");
+        drop(db);
 
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temp db");
     }
 
     #[test]
@@ -469,8 +470,9 @@ mod tests {
         let tasks = db.tasks_for_day(day).expect("query day");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Write the quarterly report");
+        drop(db);
 
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove temp db");
     }
 
     #[test]

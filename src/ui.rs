@@ -10,11 +10,11 @@ use chrono::{Datelike, Local, NaiveDate};
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, List, ListItem, ListState, Paragraph,
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph,
         calendar::{CalendarEventStore, Monthly},
     },
 };
@@ -257,7 +257,7 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
             (
                 Line::raw(format!("{}/{} done", done, visible.len())),
                 Line::raw(
-                    "j/k move · x toggle · a add · e edit · [ ] day · t today · Tab cal · q quit",
+                    "j/k move · x toggle · a add · e edit · [ ] day · t today · Tab cal · ? help · q quit",
                 ),
             )
         }
@@ -267,6 +267,74 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         ),
     };
     frame.render_widget(Paragraph::new(vec![status, help]), chunks[section]);
+
+    if app.help_open() {
+        let popup = centered_rect(70, 80, frame.area());
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(help_text()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Help — ?/Esc to close"),
+            ),
+            popup,
+        );
+    }
+}
+
+/// Centered rectangle covering the given percentages of `area`.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+/// Every keybinding in the app, grouped by context.
+fn help_text() -> Vec<Line<'static>> {
+    vec![
+        Line::raw("Day list"),
+        Line::raw("  j/k, arrows   move selection"),
+        Line::raw("  x, Space      toggle done"),
+        Line::raw("  a             add task"),
+        Line::raw("  e, Enter      edit task"),
+        Line::raw("  Tab           focus calendar"),
+        Line::raw("  q             quit"),
+        Line::raw(""),
+        Line::raw("Days"),
+        Line::raw("  [ / ]         previous / next day"),
+        Line::raw("  t             back to today"),
+        Line::raw(""),
+        Line::raw("Calendar (Tab to focus)"),
+        Line::raw("  arrows, hjkl  move cursor (up/down = week)"),
+        Line::raw("  Enter, Space  jump to cursor day"),
+        Line::raw("  Esc, Tab      back to list"),
+        Line::raw(""),
+        Line::raw("Add"),
+        Line::raw("  type, Backspace, Enter commit, Esc cancel"),
+        Line::raw(""),
+        Line::raw("Edit"),
+        Line::raw("  Tab / Shift+Tab  switch field"),
+        Line::raw("  Left/Right, Space cycle priority"),
+        Line::raw("  type, Backspace  edit field"),
+        Line::raw("  Enter            commit (newline in notes)"),
+        Line::raw("  Ctrl+S           save"),
+        Line::raw("  Esc              cancel"),
+        Line::raw(""),
+        Line::raw("  ?             this help"),
+    ]
 }
 
 /// Pure key-to-message mapping; unmapped keys yield None (ignored).
@@ -301,6 +369,7 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
             KeyCode::Char(']') => Some(Message::ViewNextDay),
             KeyCode::Char('t') => Some(Message::ViewToday(today)),
             KeyCode::Char('q') => Some(Message::Quit),
+            KeyCode::Char('?') => Some(Message::ToggleHelp),
             _ if calendar_focused => match key.code {
                 KeyCode::Left | KeyCode::Char('h') => Some(Message::MoveCursor(-1)),
                 KeyCode::Right | KeyCode::Char('l') => Some(Message::MoveCursor(1)),
@@ -324,13 +393,27 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
 }
 
 /// Block until a key maps to a message for the current mode and focus.
-fn read_message(mode: Mode, calendar_focused: bool, today: NaiveDate) -> std::io::Result<Message> {
+/// While the help overlay is open the app behind it is frozen: only `?`
+/// and `Esc` get through (closing help); every other key is swallowed so
+/// the overlay can neither act nor be left stale behind.
+fn read_message(
+    mode: Mode,
+    calendar_focused: bool,
+    today: NaiveDate,
+    help_open: bool,
+) -> std::io::Result<Message> {
     loop {
         let Event::Key(key) = event::read()? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
             continue;
+        }
+        if help_open {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc => return Ok(Message::ToggleHelp),
+                _ => continue,
+            }
         }
         if let Some(message) = map_key(key, mode, calendar_focused, today) {
             return Ok(message);
@@ -355,7 +438,12 @@ fn event_loop(
     loop {
         let today = Local::now().date_naive();
         terminal.draw(|frame| render(frame, app, today))?;
-        let effects = app.update(read_message(app.mode(), app.calendar_focused(), today)?);
+        let effects = app.update(read_message(
+            app.mode(),
+            app.calendar_focused(),
+            today,
+            app.help_open(),
+        )?);
         if !effects.is_empty() {
             for effect in effects {
                 match effect {
@@ -448,6 +536,15 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char('e')), Mode::Browse, false, today),
             Some(Message::BeginEdit)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('?')), Mode::Browse, false, today),
+            Some(Message::ToggleHelp)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('?')), Mode::Browse, true, today),
+            Some(Message::ToggleHelp),
+            "help is reachable while focused"
         );
     }
 

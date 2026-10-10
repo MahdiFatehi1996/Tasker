@@ -153,6 +153,8 @@ pub enum Message {
     /// Save the edit (only emits when drafts differ).
     CommitEdit,
     CancelEdit,
+    /// Toggle the in-app keybinding help overlay.
+    ToggleHelp,
     Quit,
 }
 
@@ -179,6 +181,7 @@ pub struct App {
     editor: Option<EditorState>,
     calendar_focused: bool,
     cursor: NaiveDate,
+    help_open: bool,
     should_quit: bool,
 }
 
@@ -195,6 +198,7 @@ impl App {
             draft: String::new(),
             editor: None,
             calendar_focused: false,
+            help_open: false,
             should_quit: false,
         };
         app.set_tasks(tasks);
@@ -306,6 +310,11 @@ impl App {
     /// The calendar cursor day.
     pub fn cursor(&self) -> NaiveDate {
         self.cursor
+    }
+
+    /// Whether the keybinding help overlay is open.
+    pub fn help_open(&self) -> bool {
+        self.help_open
     }
 
     pub fn should_quit(&self) -> bool {
@@ -513,6 +522,10 @@ impl App {
                     self.editor = None;
                     self.set_mode(Mode::Browse);
                 }
+                vec![]
+            }
+            Message::ToggleHelp => {
+                self.help_open = !self.help_open;
                 vec![]
             }
             Message::Quit => {
@@ -1065,5 +1078,15 @@ mod tests {
         assert_eq!(app.mode(), Mode::Browse);
         assert_eq!(app.editor(), None);
         assert_eq!(app.update(Message::CommitEdit), vec![]);
+    }
+
+    #[test]
+    fn help_overlay_toggles() {
+        let mut app = three_tasks();
+        assert!(!app.help_open());
+        assert_eq!(app.update(Message::ToggleHelp), vec![]);
+        assert!(app.help_open());
+        assert_eq!(app.update(Message::ToggleHelp), vec![]);
+        assert!(!app.help_open());
     }
 }
