@@ -256,8 +256,6 @@ impl Database {
 
     /// Store a new task; returns its assigned id. New tasks are never done
     /// and start with zero tracked seconds.
-    /// First wired into user flows by ticket #3; tests are the first caller.
-    #[allow(dead_code)]
     pub fn save_task(&self, task: &NewTask) -> Result<i64, Error> {
         let due_text = task.due.as_ref().map(format_due);
         self.conn.execute(
@@ -278,8 +276,6 @@ impl Database {
     /// Persist changes to an existing task's title, state, priority, notes,
     /// due moment, tracked seconds, and tags. The task keeps its original
     /// day and id.
-    /// First wired into user flows by ticket #6; tests are the first caller.
-    #[allow(dead_code)]
     pub fn update_task(&self, task: &Task) -> Result<(), Error> {
         let due_text = task.due.as_ref().map(format_due);
         self.conn.execute(
@@ -299,8 +295,6 @@ impl Database {
     }
 
     /// Single task by id, with tags, or `None` when missing.
-    /// Wired into user flows by later Pro tickets; tests are the first caller.
-    #[allow(dead_code)]
     pub fn task_by_id(&self, id: i64) -> Result<Option<Task>, Error> {
         let tasks = self.collect_with_tags(
             &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
@@ -314,6 +308,15 @@ impl Database {
         self.collect_with_tags(
             &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE day = ?1 ORDER BY id"),
             [day.format(DAY_FORMAT).to_string()],
+        )
+    }
+
+    /// Every task in the database, ordered by day then id, with tags:
+    /// the full-fidelity dump behind `tasker export --format json`.
+    pub fn all_tasks(&self) -> Result<Vec<Task>, Error> {
+        self.collect_with_tags(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY day, id"),
+            [],
         )
     }
 
@@ -332,8 +335,6 @@ impl Database {
     /// Open tasks whose due moment falls within `today` (date part equals
     /// `today`), oldest due first: the Due-today section. Done tasks and
     /// tasks without a due moment are excluded.
-    /// Wired into user flows by Pro P2; tests are the first caller.
-    #[allow(dead_code)]
     pub fn due_today_tasks(&self, today: NaiveDate) -> Result<Vec<Task>, Error> {
         self.collect_with_tags(
             &format!(
@@ -346,8 +347,6 @@ impl Database {
     /// Open tasks whose due moment is strictly before `now`, oldest due
     /// first: the Missed-due section. Done tasks and tasks without a due
     /// moment are excluded.
-    /// Wired into user flows by Pro P2; tests are the first caller.
-    #[allow(dead_code)]
     pub fn missed_due_tasks(&self, now: NaiveDateTime) -> Result<Vec<Task>, Error> {
         self.collect_with_tags(
             &format!(
@@ -438,8 +437,6 @@ impl Database {
     }
 
     /// Every tag name in use, sorted ascending: the tag-filter cycle order.
-    /// Wired into user flows by Pro P3; tests are the first caller.
-    #[allow(dead_code)]
     pub fn all_tags(&self) -> Result<Vec<String>, Error> {
         let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
         let names = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -448,8 +445,6 @@ impl Database {
 
     /// Add (or subtract, clamped at zero) tracked seconds for a task.
     /// Survives restarts: the total lives in the tasks row.
-    /// Wired into user flows by Pro P4; tests are the first caller.
-    #[allow(dead_code)]
     pub fn add_tracked_secs(&self, task_id: i64, delta_secs: i64) -> Result<(), Error> {
         self.conn.execute(
             "UPDATE tasks SET tracked_secs = CASE WHEN tracked_secs + ?1 < 0 THEN 0 ELSE tracked_secs + ?1 END WHERE id = ?2",
@@ -613,6 +608,29 @@ mod tests {
         assert_eq!(task.due, Some(due));
         assert_eq!(task.tags, vec!["admin".to_string(), "work".to_string()]);
         assert_eq!(task.tracked_secs, 0);
+    }
+
+    #[test]
+    fn all_tasks_returns_every_day_ordered_with_tags() {
+        let db = memory_db();
+        let later = NaiveDate::from_ymd_opt(2026, 10, 12).expect("valid date");
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        for (day, title) in [(later, "later work"), (earlier, "earlier work")] {
+            db.save_task(&NewTask {
+                day,
+                title: title.to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+                due: None,
+                tags: vec!["work".to_string()],
+            })
+            .expect("save task");
+        }
+        let all = db.all_tasks().expect("dump all tasks");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].title, "earlier work", "ordered oldest day first");
+        assert_eq!(all[1].title, "later work");
+        assert_eq!(all[0].tags, vec!["work".to_string()]);
     }
 
     #[test]

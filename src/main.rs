@@ -1,39 +1,50 @@
-//! Tasker: a TUI daily task manager. See issue #1 for the spec.
+//! Tasker: a TUI daily task manager with a non-interactive CLI companion.
+//!
+//! Bare `tasker` launches the TUI; `add` / `done` / `list` / `export` run
+//! against the same storage seam. See issues #8 and #13 for the Pro spec.
 
 mod app;
+mod cli;
 mod db;
 mod model;
+mod theme;
 mod ui;
-
-use std::path::PathBuf;
-
-use chrono::Local;
 
 use app::App;
 use db::{Database, resolve_db_path};
 use model::format_due_input;
 
-/// Parse an optional `--db <path>` / `--db=<path>` argument.
-fn parse_db_arg(args: &[String]) -> Option<PathBuf> {
-    let mut iter = args.iter().skip(1);
-    while let Some(arg) = iter.next() {
-        if let Some(path) = arg.strip_prefix("--db=") {
-            return Some(PathBuf::from(path));
-        }
-        if arg == "--db"
-            && let Some(path) = iter.next()
-        {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = resolve_db_path(parse_db_arg(&args));
-    let database = Database::open(&path)?;
-    let now = Local::now().naive_local();
+    let (db_arg, command) = match cli::parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("error: {message}");
+            eprintln!("{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    let database = Database::open(&resolve_db_path(db_arg))?;
+    match command {
+        cli::Command::Tui => run_tui(&database),
+        command => match cli::execute(&database, command) {
+            Ok(output) => {
+                if !output.is_empty() {
+                    println!("{output}");
+                }
+                Ok(())
+            }
+            Err(message) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// Launch the interactive day-list TUI for `database`.
+fn run_tui(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
+    let now = chrono::Local::now().naive_local();
     let today = now.date();
     let mut app = App::new(
         today,
@@ -45,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     notify_missed_due(&missed);
     app.set_missed_due(missed);
     app.set_all_tags(database.all_tags()?);
-    ui::run(&database, &mut app)?;
+    ui::run(database, &mut app)?;
     Ok(())
 }
 

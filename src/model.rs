@@ -25,14 +25,21 @@ impl Priority {
     ];
 
     /// Canonical lowercase name, as stored in the database.
-    /// First used by flows in ticket #3; tests are the first caller.
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         Self::VARIANTS
             .into_iter()
             .find(|(priority, _)| *priority == self)
             .map(|(_, name)| name)
             .expect("every priority has a canonical name")
+    }
+
+    /// Single-letter badge shown on compact task rows (`L`/`M`/`H`).
+    pub fn letter(self) -> char {
+        match self {
+            Priority::Low => 'L',
+            Priority::Medium => 'M',
+            Priority::High => 'H',
+        }
     }
 
     /// Parse a canonical priority name (case-insensitive).
@@ -82,8 +89,6 @@ impl Task {
 }
 
 /// A task not yet stored: everything except id, done state, and timer total.
-/// Constructed by add-flows from ticket #3; tests are the first caller.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTask {
     pub day: NaiveDate,
@@ -99,7 +104,6 @@ pub struct NewTask {
 impl NewTask {
     /// Minimal new task pinned to `day` with a title: medium priority,
     /// no notes, no due moment, no tags. Timer starts at zero on save.
-    #[allow(dead_code)]
     pub fn dated(day: NaiveDate, title: String) -> NewTask {
         NewTask {
             day,
@@ -181,6 +185,15 @@ pub fn parse_due_input(s: &str) -> Option<Option<NaiveDateTime>> {
     None
 }
 
+/// Render accumulated tracked seconds as `H:MM` (minutes truncated, never
+/// negative). Sub-hour totals show `0:MM`; the hour count is unbounded.
+pub fn format_tracked(secs: i64) -> String {
+    let secs = secs.max(0);
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    format!("{hours}:{minutes:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +227,23 @@ mod tests {
         assert_eq!(parse_due_input("soon"), None);
         assert_eq!(parse_due_input("2026-13-10 12:30"), None);
         assert_eq!(parse_due_input("12:30"), None);
+    }
+
+    #[test]
+    fn tracked_seconds_render_as_h_mm() {
+        assert_eq!(format_tracked(0), "0:00");
+        assert_eq!(format_tracked(59), "0:00");
+        assert_eq!(format_tracked(60), "0:01");
+        assert_eq!(format_tracked(90), "0:01");
+        assert_eq!(format_tracked(3599), "0:59");
+        assert_eq!(format_tracked(3600), "1:00");
+        assert_eq!(format_tracked(5400), "1:30");
+        assert_eq!(format_tracked(36_000), "10:00");
+    }
+
+    #[test]
+    fn tracked_seconds_clamp_negative_totals() {
+        assert_eq!(format_tracked(-5), "0:00");
     }
 
     #[test]

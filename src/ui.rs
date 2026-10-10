@@ -6,12 +6,14 @@
 //! output is verified manually (headless frame capture); only the keymap
 //! has unit tests.
 
-use chrono::{Datelike, Local, NaiveDate};
+use std::time::Duration;
+
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph,
@@ -21,15 +23,8 @@ use ratatui::{
 
 use crate::app::{App, EditField, EditorState, Effect, Message, Mode};
 use crate::db::Database;
-use crate::model::{Priority, Task, format_due_input};
-
-fn priority_letter(priority: Priority) -> char {
-    match priority {
-        Priority::Low => 'L',
-        Priority::Medium => 'M',
-        Priority::High => 'H',
-    }
-}
+use crate::model::{Priority, Task, format_due_input, format_tracked};
+use crate::theme;
 
 fn to_time_date(day: NaiveDate) -> time::Date {
     time::Date::from_calendar_date(
@@ -48,21 +43,18 @@ fn month_calendar(app: &App, today: NaiveDate) -> Monthly<'_, CalendarEventStore
     let focused = app.calendar_focused();
 
     let mut store = CalendarEventStore::default();
-    store.add(
-        to_time_date(today),
-        Style::default().add_modifier(Modifier::BOLD),
-    );
+    store.add(to_time_date(today), theme::strong());
 
-    let mut viewed_style = Style::default().add_modifier(Modifier::REVERSED);
+    let mut viewed_style = theme::selection();
     if viewed == today {
         viewed_style = viewed_style.add_modifier(Modifier::BOLD);
     }
     store.add(to_time_date(viewed), viewed_style);
 
     if focused {
-        let mut cursor_style = Style::default().add_modifier(Modifier::UNDERLINED);
+        let mut cursor_style = theme::caret();
         if cursor == viewed {
-            cursor_style = cursor_style.add_modifier(Modifier::REVERSED);
+            cursor_style = theme::selection();
         }
         if cursor == today {
             cursor_style = cursor_style.add_modifier(Modifier::BOLD);
@@ -72,8 +64,9 @@ fn month_calendar(app: &App, today: NaiveDate) -> Monthly<'_, CalendarEventStore
 
     let display = if focused { cursor } else { viewed };
     Monthly::new(to_time_date(display), store)
-        .show_weekdays_header(Style::default().add_modifier(Modifier::DIM))
-        .show_month_header(Style::default().add_modifier(Modifier::BOLD))
+        .default_style(theme::text())
+        .show_weekdays_header(theme::dim())
+        .show_month_header(theme::strong())
 }
 
 /// Note lines visible in the editor panel; older lines collapse behind an
@@ -81,29 +74,52 @@ fn month_calendar(app: &App, today: NaiveDate) -> Monthly<'_, CalendarEventStore
 const EDITOR_NOTES_VISIBLE: usize = 3;
 
 /// Editor panel height: borders + title + priority + notes label +
-/// visible lines + due row + tags row.
-const EDITOR_PANEL_HEIGHT: u16 = 2 + 1 + 1 + 1 + EDITOR_NOTES_VISIBLE as u16 + 2;
+/// visible lines + due row + tags row + tracked row.
+const EDITOR_PANEL_HEIGHT: u16 = 2 + 1 + 1 + 1 + EDITOR_NOTES_VISIBLE as u16 + 3;
 
 /// Detail editor panel: focused field marked, text caret at the draft end.
-/// Notes show the last few lines so the tail follows typing.
-fn editor_panel(editor: &EditorState) -> Paragraph<'_> {
-    let marker = |focused: bool| if focused { "> " } else { "  " };
+/// Notes show the last few lines so the tail follows typing. `tracked` is the
+/// task's displayed timer total (`H:MM`), including any live running segment.
+fn editor_panel<'a>(editor: &'a EditorState, tracked: &'a str) -> Paragraph<'a> {
     let field = editor.field();
+    let marker = |focused: bool| {
+        Span::styled(
+            if focused { "> " } else { "  " },
+            if focused {
+                theme::strong()
+            } else {
+                theme::dim()
+            },
+        )
+    };
+    let content = |text: String, focused: bool| {
+        Span::styled(
+            with_caret(&text, focused),
+            if focused {
+                theme::caret()
+            } else {
+                theme::text()
+            },
+        )
+    };
     let mut lines = vec![
         Line::from(vec![
-            Span::raw(marker(field == EditField::Title)),
-            Span::raw(format!(
-                "Title: {}",
-                with_caret(editor.title(), field == EditField::Title)
-            )),
+            marker(field == EditField::Title),
+            content(
+                format!("Title: {}", editor.title()),
+                field == EditField::Title,
+            ),
         ]),
         Line::from(vec![
-            Span::raw(marker(field == EditField::Priority)),
-            Span::raw(format!("Priority: {}", editor.priority().as_str())),
+            marker(field == EditField::Priority),
+            Span::styled(
+                format!("Priority: {}", editor.priority().as_str()),
+                theme::text(),
+            ),
         ]),
         Line::from(vec![
-            Span::raw(marker(field == EditField::Notes)),
-            Span::raw("Notes:"),
+            marker(field == EditField::Notes),
+            Span::styled("Notes:", theme::text()),
         ]),
     ];
     let note_lines: Vec<&str> = editor.notes().split('\n').collect();
@@ -116,27 +132,39 @@ fn editor_panel(editor: &EditorState) -> Paragraph<'_> {
     };
     let visible = &note_lines[start..];
     if show_indicator {
-        lines.push(Line::raw(format!("    ↑ {} more line(s) above", start)));
+        lines.push(Line::styled(
+            format!("    ↑ {} more line(s) above", start),
+            theme::dim(),
+        ));
     }
     for (i, line) in visible.iter().enumerate() {
         let focused = i + 1 == visible.len() && field == EditField::Notes;
-        lines.push(Line::raw(format!("    {}", with_caret(line, focused))));
+        lines.push(Line::from(vec![
+            Span::styled("    ", theme::text()),
+            content(line.to_string(), focused),
+        ]));
     }
     lines.push(Line::from(vec![
-        Span::raw(marker(field == EditField::Due)),
-        Span::raw(format!(
-            "Due: {}",
-            with_caret(editor.due_text(), field == EditField::Due)
-        )),
+        marker(field == EditField::Due),
+        content(
+            format!("Due: {}", editor.due_text()),
+            field == EditField::Due,
+        ),
     ]));
     lines.push(Line::from(vec![
-        Span::raw(marker(field == EditField::Tags)),
-        Span::raw(format!(
-            "Tags: {}",
-            with_caret(editor.tags_text(), field == EditField::Tags)
-        )),
+        marker(field == EditField::Tags),
+        content(
+            format!("Tags: {}", editor.tags_text()),
+            field == EditField::Tags,
+        ),
     ]));
-    Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Edit"))
+    lines.push(Line::from(vec![
+        marker(false),
+        Span::styled(format!("Tracked: {tracked}"), theme::dim()),
+    ]));
+    Paragraph::new(lines)
+        .style(theme::text())
+        .block(section_block("Edit", theme::strong()))
 }
 
 /// Append the text caret when its field holds keyboard focus.
@@ -150,14 +178,26 @@ fn with_caret(text: &str, focused: bool) -> String {
 
 /// One task row. `selected` drives the cursor marker; `flag` (the day pin
 /// of an overdue task, or the due moment of a due-section task) renders
-/// after the checkbox when present.
-fn task_row(task: &Task, selected: bool, flag: Option<String>) -> ListItem<'_> {
+/// after the checkbox when present. `timer` (`H:MM`) renders as a dim suffix
+/// on every row, so each task's accumulated time is visible at a glance.
+fn task_row(task: &Task, selected: bool, flag: Option<String>, timer: String) -> ListItem<'_> {
     let marker = if selected { "> " } else { "  " };
     let checkbox = if task.done { "[x]" } else { "[ ]" };
-    let row_style = if task.done {
-        Style::default().add_modifier(Modifier::CROSSED_OUT)
+    let row_style = if selected {
+        theme::selection()
+    } else if task.done {
+        theme::done()
     } else {
-        Style::default()
+        theme::text()
+    };
+    let badge_style = if selected {
+        theme::selection()
+    } else if task.done {
+        theme::done()
+    } else if task.priority == Priority::High {
+        theme::alert()
+    } else {
+        theme::dim()
     };
     let mut spans = vec![
         Span::styled(marker, row_style),
@@ -167,10 +207,23 @@ fn task_row(task: &Task, selected: bool, flag: Option<String>) -> ListItem<'_> {
         spans.push(Span::styled(format!("[{}] ", flag), row_style));
     }
     spans.push(Span::styled(
-        format!("[{}] {}", priority_letter(task.priority), task.title),
-        row_style,
+        format!("[{}] ", task.priority.letter()),
+        badge_style,
     ));
+    spans.push(Span::styled(task.title.clone(), row_style));
+    spans.push(Span::styled(format!(" {timer}"), theme::dim()));
     ListItem::new(Line::from(spans))
+}
+
+/// Timer suffix for a row: the stored total plus any live running segment,
+/// as `H:MM`, prefixed with a play marker while the task is being timed.
+fn timer_display(app: &App, task: &Task, now: NaiveDateTime) -> String {
+    let total = format_tracked(app.tracked_display(task, now));
+    if app.running_task_id() == Some(task.id) {
+        format!("▶ {total}")
+    } else {
+        total
+    }
 }
 
 /// Append `#tags` to a section flag so filtered rows show why they
@@ -204,10 +257,25 @@ fn tags_flag(task: &Task) -> Option<String> {
     }
 }
 
+/// Bordered section frame in the palette: dim border, themed title, and the
+/// amber backdrop so blank rows inside the box stay on-theme.
+fn section_block(title: &str, title_style: Style) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .title_style(title_style)
+        .border_style(theme::block())
+        .style(theme::text())
+}
+
 /// Draw one frame: calendar pane left, day-list column right
 /// (Missed-due and Due-today sections when non-empty, Overdue section
 /// when non-empty, viewed day, status footer).
-fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
+fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
+    // Paint the whole frame in the palette first, so any cell no widget
+    // covers still sits on the amber-phosphor backdrop.
+    frame.render_widget(Block::default().style(theme::text()), frame.area());
+
     let calendar = month_calendar(app, today);
     let outer = Layout::default()
         .direction(Direction::Horizontal)
@@ -215,16 +283,18 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         .split(frame.area());
 
     let border_style = if app.calendar_focused() {
-        Style::default().fg(Color::Yellow)
+        theme::focused_block()
     } else {
-        Style::default()
+        theme::block()
     };
     frame.render_widget(
         calendar.block(
             Block::default()
                 .borders(Borders::ALL)
                 .title("Calendar")
-                .border_style(border_style),
+                .title_style(theme::strong())
+                .border_style(border_style)
+                .style(theme::text()),
         ),
         outer[0],
     );
@@ -262,10 +332,18 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         let items: Vec<ListItem> = missed
             .iter()
             .enumerate()
-            .map(|(i, task)| task_row(task, Some(i) == cursor, due_flag(task)))
+            .map(|(i, task)| {
+                task_row(
+                    task,
+                    Some(i) == cursor,
+                    due_flag(task),
+                    timer_display(app, task, now),
+                )
+            })
             .collect();
-        let list =
-            List::new(items).block(Block::default().borders(Borders::ALL).title("Missed Due"));
+        let list = List::new(items)
+            .style(theme::text())
+            .block(section_block("Missed Due", theme::alert()));
         let mut state = ListState::default();
         state.select(cursor);
         frame.render_stateful_widget(list, chunks[section], &mut state);
@@ -276,10 +354,18 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         let items: Vec<ListItem> = due_today
             .iter()
             .enumerate()
-            .map(|(i, task)| task_row(task, Some(i) == cursor, due_flag(task)))
+            .map(|(i, task)| {
+                task_row(
+                    task,
+                    Some(i) == cursor,
+                    due_flag(task),
+                    timer_display(app, task, now),
+                )
+            })
             .collect();
-        let list =
-            List::new(items).block(Block::default().borders(Borders::ALL).title("Due Today"));
+        let list = List::new(items)
+            .style(theme::text())
+            .block(section_block("Due Today", theme::strong()));
         let mut state = ListState::default();
         state.select(cursor);
         frame.render_stateful_widget(list, chunks[section], &mut state);
@@ -290,9 +376,18 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         let items: Vec<ListItem> = overdue
             .iter()
             .enumerate()
-            .map(|(i, task)| task_row(task, Some(i) == cursor, Some(day_flag(task))))
+            .map(|(i, task)| {
+                task_row(
+                    task,
+                    Some(i) == cursor,
+                    Some(day_flag(task)),
+                    timer_display(app, task, now),
+                )
+            })
             .collect();
-        let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Overdue"));
+        let list = List::new(items)
+            .style(theme::text())
+            .block(section_block("Overdue", theme::strong()));
         let mut state = ListState::default();
         state.select(cursor);
         frame.render_stateful_widget(list, chunks[section], &mut state);
@@ -303,11 +398,20 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
     let items: Vec<ListItem> = tasks
         .iter()
         .enumerate()
-        .map(|(i, task)| task_row(task, Some(i) == cursor, tags_flag(task)))
+        .map(|(i, task)| {
+            task_row(
+                task,
+                Some(i) == cursor,
+                tags_flag(task),
+                timer_display(app, task, now),
+            )
+        })
         .collect();
 
     let title = format!("Tasker — {}", app.viewed().format("%a %b %d, %Y"));
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    let list = List::new(items)
+        .style(theme::text())
+        .block(section_block(&title, theme::strong()));
     let mut state = ListState::default();
     state.select(cursor);
     frame.render_stateful_widget(list, chunks[section], &mut state);
@@ -316,21 +420,19 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
     if app.mode() == Mode::Detail
         && let Some(editor) = app.editor()
     {
-        frame.render_widget(editor_panel(editor), chunks[section]);
+        let tracked = format_tracked(app.tracked_display(editor.original(), now));
+        frame.render_widget(editor_panel(editor, &tracked), chunks[section]);
         section += 1;
     }
 
     let (status, help) = match app.mode() {
         Mode::Adding => (
             Line::from(vec![
-                Span::raw("Add: "),
-                Span::styled(
-                    app.draft(),
-                    Style::default().add_modifier(Modifier::UNDERLINED),
-                ),
-                Span::raw("▌"),
+                Span::styled("Add: ", theme::strong()),
+                Span::styled(app.draft().to_string(), theme::caret()),
+                Span::styled("▌", theme::caret()),
             ]),
-            Line::raw("Enter commit · Esc cancel"),
+            Line::styled("Enter commit · Esc cancel", theme::dim()),
         ),
         Mode::Browse => {
             let total = missed.len() + due_today.len() + overdue.len() + tasks.len();
@@ -343,29 +445,36 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
                 Some(tag) => format!("[#{tag}] {done}/{total} done"),
                 None => format!("{done}/{total} done"),
             };
+            let status_style = if missed.is_empty() {
+                theme::strong()
+            } else {
+                theme::alert()
+            };
             (
-                Line::raw(status),
-                Line::raw(
-                    "j/k move · x toggle · a add · e edit · f filter · [ ] day · t today · Tab cal · ? help · q quit",
+                Line::styled(status, status_style),
+                Line::styled(
+                    "j/k move · x toggle · a add · e edit · w timer · f filter · [ ] day · t today · Tab cal · ? help · q quit",
+                    theme::dim(),
                 ),
             )
         }
         Mode::Detail => (
-            Line::raw("Enter commit/newline · Ctrl+S save"),
-            Line::raw("Tab field · ←/→ priority · Esc cancel"),
+            Line::styled("Enter commit/newline · Ctrl+S save", theme::strong()),
+            Line::styled("Tab field · ←/→ priority · Esc cancel", theme::dim()),
         ),
     };
-    frame.render_widget(Paragraph::new(vec![status, help]), chunks[section]);
+    frame.render_widget(
+        Paragraph::new(vec![status, help]).style(theme::text()),
+        chunks[section],
+    );
 
     if app.help_open() {
         let popup = centered_rect(70, 80, frame.area());
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(help_text()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Help — ?/Esc to close"),
-            ),
+            Paragraph::new(help_text())
+                .style(theme::text())
+                .block(section_block("Help — ?/Esc to close", theme::strong())),
             popup,
         );
     }
@@ -399,6 +508,7 @@ fn help_text() -> Vec<Line<'static>> {
         Line::raw("  x, Space      toggle done"),
         Line::raw("  a             add task"),
         Line::raw("  e, Enter      edit task"),
+        Line::raw("  w             start/stop timer (one at a time)"),
         Line::raw("  f             cycle tag filter"),
         Line::raw("  Esc           clear tag filter"),
         Line::raw("  Tab           focus calendar"),
@@ -431,7 +541,14 @@ fn help_text() -> Vec<Line<'static>> {
 }
 
 /// Pure key-to-message mapping; unmapped keys yield None (ignored).
-fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) -> Option<Message> {
+/// `now` carries the wall clock into time-stamped messages (`t`, `w`, `q`) so
+/// state stays pure.
+fn map_key(
+    key: KeyEvent,
+    mode: Mode,
+    calendar_focused: bool,
+    now: NaiveDateTime,
+) -> Option<Message> {
     match mode {
         Mode::Adding => match key.code {
             KeyCode::Esc => Some(Message::CancelAdd),
@@ -460,8 +577,8 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
             // Global day keys work regardless of calendar focus.
             KeyCode::Char('[') => Some(Message::ViewPrevDay),
             KeyCode::Char(']') => Some(Message::ViewNextDay),
-            KeyCode::Char('t') => Some(Message::ViewToday(today)),
-            KeyCode::Char('q') => Some(Message::Quit),
+            KeyCode::Char('t') => Some(Message::ViewToday(now.date())),
+            KeyCode::Char('q') => Some(Message::Quit(now)),
             KeyCode::Char('?') => Some(Message::ToggleHelp),
             _ if calendar_focused => match key.code {
                 KeyCode::Left | KeyCode::Char('h') => Some(Message::MoveCursor(-1)),
@@ -478,6 +595,7 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
                 KeyCode::Char('x') | KeyCode::Char(' ') => Some(Message::ToggleSelected),
                 KeyCode::Char('a') => Some(Message::BeginAdd),
                 KeyCode::Char('e') | KeyCode::Enter => Some(Message::BeginEdit),
+                KeyCode::Char('w') => Some(Message::ToggleTimer(now)),
                 KeyCode::Char('f') => Some(Message::CycleTagFilter),
                 KeyCode::Esc => Some(Message::ClearTagFilter),
                 KeyCode::Tab => Some(Message::FocusCalendar),
@@ -491,12 +609,7 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
 /// While the help overlay is open the app behind it is frozen: only `?`
 /// and `Esc` get through (closing help); every other key is swallowed so
 /// the overlay can neither act nor be left stale behind.
-fn read_message(
-    mode: Mode,
-    calendar_focused: bool,
-    today: NaiveDate,
-    help_open: bool,
-) -> std::io::Result<Message> {
+fn read_message(mode: Mode, calendar_focused: bool, help_open: bool) -> std::io::Result<Message> {
     loop {
         let Event::Key(key) = event::read()? else {
             continue;
@@ -510,7 +623,10 @@ fn read_message(
                 _ => continue,
             }
         }
-        if let Some(message) = map_key(key, mode, calendar_focused, today) {
+        // Read the clock after the key so timer starts are stamped at the
+        // moment of the press, not when the previous frame was drawn.
+        let now = Local::now().naive_local();
+        if let Some(message) = map_key(key, mode, calendar_focused, now) {
             return Ok(message);
         }
     }
@@ -531,12 +647,19 @@ fn event_loop(
     app: &mut App,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let today = Local::now().date_naive();
-        terminal.draw(|frame| render(frame, app, today))?;
+        let now = Local::now().naive_local();
+        let today = now.date();
+        terminal.draw(|frame| render(frame, app, today, now))?;
+        // Idle refreshes keep a running timer ticking; any key wakes us at once.
+        if !event::poll(Duration::from_millis(500))? {
+            if app.should_quit() {
+                break;
+            }
+            continue;
+        }
         let effects = app.update(read_message(
             app.mode(),
             app.calendar_focused(),
-            today,
             app.help_open(),
         )?);
         if !effects.is_empty() {
@@ -548,6 +671,12 @@ fn event_loop(
                     Effect::Update(task) => {
                         db.update_task(&task)?;
                     }
+                    Effect::AddTrackedSecs {
+                        task_id,
+                        delta_secs,
+                    } => {
+                        db.add_tracked_secs(task_id, delta_secs)?;
+                    }
                     Effect::Reload => {}
                 }
             }
@@ -557,7 +686,6 @@ fn event_loop(
             // a future day must not promote today's tasks into them.
             app.set_overdue(db.overdue_tasks(today)?);
             app.set_due_today(db.due_today_tasks(today)?);
-            let now = Local::now().naive_local();
             app.set_missed_due(db.missed_due_tasks(now)?);
             // Tag names feed the `f` filter cycle; a filter pointing at a
             // vanished tag clears inside the setter.
@@ -579,79 +707,87 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 10, 10).expect("valid date")
     }
 
+    fn noon() -> NaiveDateTime {
+        day().and_hms_opt(12, 0, 0).expect("valid datetime")
+    }
+
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
     fn browse_list_keys_map() {
-        let today = day();
+        let now = noon();
         assert_eq!(
-            map_key(press(KeyCode::Char('q')), Mode::Browse, false, today),
-            Some(Message::Quit)
+            map_key(press(KeyCode::Char('q')), Mode::Browse, false, now),
+            Some(Message::Quit(now))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('j')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('j')), Mode::Browse, false, now),
             Some(Message::SelectNext)
         );
         assert_eq!(
-            map_key(press(KeyCode::Down), Mode::Browse, false, today),
+            map_key(press(KeyCode::Down), Mode::Browse, false, now),
             Some(Message::SelectNext)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('k')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('k')), Mode::Browse, false, now),
             Some(Message::SelectPrev)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('x')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('x')), Mode::Browse, false, now),
             Some(Message::ToggleSelected)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(' ')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char(' ')), Mode::Browse, false, now),
             Some(Message::ToggleSelected)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('a')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('a')), Mode::Browse, false, now),
             Some(Message::BeginAdd)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('[')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('[')), Mode::Browse, false, now),
             Some(Message::ViewPrevDay)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(']')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char(']')), Mode::Browse, false, now),
             Some(Message::ViewNextDay)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('t')), Mode::Browse, false, today),
-            Some(Message::ViewToday(today))
+            map_key(press(KeyCode::Char('t')), Mode::Browse, false, now),
+            Some(Message::ViewToday(day()))
         );
         assert_eq!(
-            map_key(press(KeyCode::Tab), Mode::Browse, false, today),
+            map_key(press(KeyCode::Tab), Mode::Browse, false, now),
             Some(Message::FocusCalendar)
         );
         assert_eq!(
-            map_key(press(KeyCode::Enter), Mode::Browse, false, today),
+            map_key(press(KeyCode::Enter), Mode::Browse, false, now),
             Some(Message::BeginEdit)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('e')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('e')), Mode::Browse, false, now),
             Some(Message::BeginEdit)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('f')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('w')), Mode::Browse, false, now),
+            Some(Message::ToggleTimer(now))
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('f')), Mode::Browse, false, now),
             Some(Message::CycleTagFilter)
         );
         assert_eq!(
-            map_key(press(KeyCode::Esc), Mode::Browse, false, today),
+            map_key(press(KeyCode::Esc), Mode::Browse, false, now),
             Some(Message::ClearTagFilter)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('?')), Mode::Browse, false, today),
+            map_key(press(KeyCode::Char('?')), Mode::Browse, false, now),
             Some(Message::ToggleHelp)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('?')), Mode::Browse, true, today),
+            map_key(press(KeyCode::Char('?')), Mode::Browse, true, now),
             Some(Message::ToggleHelp),
             "help is reachable while focused"
         );
@@ -659,88 +795,90 @@ mod tests {
 
     #[test]
     fn browse_calendar_keys_move_cursor() {
-        let today = day();
+        let now = noon();
         assert_eq!(
-            map_key(press(KeyCode::Left), Mode::Browse, true, today),
+            map_key(press(KeyCode::Left), Mode::Browse, true, now),
             Some(Message::MoveCursor(-1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Right), Mode::Browse, true, today),
+            map_key(press(KeyCode::Right), Mode::Browse, true, now),
             Some(Message::MoveCursor(1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Up), Mode::Browse, true, today),
+            map_key(press(KeyCode::Up), Mode::Browse, true, now),
             Some(Message::MoveCursor(-7))
         );
         assert_eq!(
-            map_key(press(KeyCode::Down), Mode::Browse, true, today),
+            map_key(press(KeyCode::Down), Mode::Browse, true, now),
             Some(Message::MoveCursor(7))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('h')), Mode::Browse, true, today),
+            map_key(press(KeyCode::Char('h')), Mode::Browse, true, now),
             Some(Message::MoveCursor(-1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('l')), Mode::Browse, true, today),
+            map_key(press(KeyCode::Char('l')), Mode::Browse, true, now),
             Some(Message::MoveCursor(1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Enter), Mode::Browse, true, today),
+            map_key(press(KeyCode::Enter), Mode::Browse, true, now),
             Some(Message::JumpToCursor)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(' ')), Mode::Browse, true, today),
+            map_key(press(KeyCode::Char(' ')), Mode::Browse, true, now),
             Some(Message::JumpToCursor)
         );
         assert_eq!(
-            map_key(press(KeyCode::Esc), Mode::Browse, true, today),
+            map_key(press(KeyCode::Esc), Mode::Browse, true, now),
             Some(Message::FocusList)
         );
         assert_eq!(
-            map_key(press(KeyCode::Tab), Mode::Browse, true, today),
+            map_key(press(KeyCode::Tab), Mode::Browse, true, now),
             Some(Message::FocusList)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(']')), Mode::Browse, true, today),
+            map_key(press(KeyCode::Char(']')), Mode::Browse, true, now),
             Some(Message::ViewNextDay),
             "day-stepping stays global while focused"
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('w')), Mode::Browse, true, now),
+            None,
+            "timer is list-scoped, like the other row actions"
         );
     }
 
     #[test]
     fn adding_keys_edit_or_commit() {
-        let today = day();
+        let now = noon();
         assert_eq!(
-            map_key(press(KeyCode::Char('b')), Mode::Adding, false, today),
+            map_key(press(KeyCode::Char('b')), Mode::Adding, false, now),
             Some(Message::AddChar('b'))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('[')), Mode::Adding, false, today),
+            map_key(press(KeyCode::Char('[')), Mode::Adding, false, now),
             Some(Message::AddChar('[')),
             "brackets type while adding"
         );
         assert_eq!(
-            map_key(press(KeyCode::Enter), Mode::Adding, false, today),
+            map_key(press(KeyCode::Enter), Mode::Adding, false, now),
             Some(Message::CommitAdd)
         );
         assert_eq!(
-            map_key(press(KeyCode::Esc), Mode::Adding, false, today),
+            map_key(press(KeyCode::Esc), Mode::Adding, false, now),
             Some(Message::CancelAdd)
         );
         assert_eq!(
-            map_key(press(KeyCode::Backspace), Mode::Adding, false, today),
+            map_key(press(KeyCode::Backspace), Mode::Adding, false, now),
             Some(Message::AddBackspace)
         );
-        assert_eq!(
-            map_key(press(KeyCode::Tab), Mode::Adding, false, today),
-            None
-        );
+        assert_eq!(map_key(press(KeyCode::Tab), Mode::Adding, false, now), None);
     }
 
     #[test]
     fn detail_keys_edit() {
-        let today = day();
-        let detail = |code| map_key(press(code), Mode::Detail, false, today);
+        let now = noon();
+        let detail = |code| map_key(press(code), Mode::Detail, false, now);
         assert_eq!(detail(KeyCode::Enter), Some(Message::PressEnter));
         assert_eq!(detail(KeyCode::Esc), Some(Message::CancelEdit));
         assert_eq!(detail(KeyCode::Tab), Some(Message::NextField));
@@ -759,9 +897,119 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
                 Mode::Detail,
                 false,
-                today
+                now
             ),
             Some(Message::CommitEdit)
         );
+    }
+
+    fn task(id: i64, title: &str) -> Task {
+        Task {
+            id,
+            day: day(),
+            title: title.to_string(),
+            done: false,
+            priority: Priority::Medium,
+            notes: String::new(),
+            due: None,
+            tracked_secs: 0,
+            tags: Vec::new(),
+        }
+    }
+
+    fn due_task(id: i64, title: &str) -> Task {
+        Task {
+            due: Some(noon()),
+            ..task(id, title)
+        }
+    }
+
+    /// Render one frame headlessly and return the backing buffer.
+    fn render_frame(app: &App, now: NaiveDateTime) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(140, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, app, now.date(), now))
+            .expect("draw frame");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Flatten a rendered buffer into plain text, one line per row.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn smoke_app() -> App {
+        let mut app = App::new(
+            day(),
+            vec![task(1, "today work"), task(2, "another task")],
+            vec![task(9, "old overdue work")],
+        );
+        app.set_missed_due(vec![due_task(7, "missed work")]);
+        app.set_due_today(vec![due_task(8, "due work")]);
+        app
+    }
+
+    #[test]
+    fn headless_frame_renders_sections_through_the_palette() {
+        let app = smoke_app();
+        let buffer = render_frame(&app, noon());
+        let text = buffer_text(&buffer);
+
+        assert!(text.contains("Missed Due"), "missed section drawn");
+        assert!(text.contains("Due Today"), "due section drawn");
+        assert!(text.contains("Overdue"), "overdue section drawn");
+        assert!(text.contains("Tasker — "), "day heading drawn");
+        assert!(text.contains("old overdue work"), "overdue row drawn");
+
+        // The palette reaches the buffer: backdrop set, and every accent used.
+        assert_eq!(buffer[(0, 0)].bg, theme::BACKGROUND);
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.fg == theme::PRIMARY),
+            "amber primary used"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme::DIM),
+            "dim secondary used"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme::ALERT),
+            "alert red used"
+        );
+    }
+
+    #[test]
+    fn headless_frame_shows_due_flags_and_timer_totals() {
+        let mut app = smoke_app();
+        let mut timed = task(3, "timed task");
+        timed.tracked_secs = 3660;
+        app.set_tasks(vec![timed]);
+
+        let text = buffer_text(&render_frame(&app, noon()));
+
+        assert!(text.contains("2026-10-10"), "due flag rendered");
+        assert!(text.contains("1:01"), "timer total rendered");
+        assert!(
+            text.contains("0:00"),
+            "every row carries a total, even at zero"
+        );
+    }
+
+    #[test]
+    fn headless_editor_frame_shows_tracked_total() {
+        let mut app = smoke_app();
+        app.update(crate::app::Message::BeginEdit);
+        let text = buffer_text(&render_frame(&app, noon()));
+        assert!(text.contains("Tracked:"), "editor pane shows timer");
     }
 }

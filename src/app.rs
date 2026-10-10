@@ -5,7 +5,7 @@
 //! against the [`Database`](crate::db::Database) and reloads the day list.
 //! Tests assert on states and effects only.
 
-use chrono::{Duration, NaiveDate};
+use chrono::{Duration, NaiveDate, NaiveDateTime};
 
 use crate::model::{
     NewTask, Priority, Task, format_due_input, format_tags_input, is_blank_title, parse_due_input,
@@ -51,6 +51,20 @@ impl EditField {
             EditField::Tags => EditField::Due,
         }
     }
+}
+
+/// The single in-memory running timer: which task, and the wall-clock moment
+/// it started. Only accumulated seconds persist; the live segment lives here
+/// and is banked on stop, on switch, and on quit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningTimer {
+    task_id: i64,
+    started: NaiveDateTime,
+}
+
+/// Whole seconds between a timer start and `now`, never negative.
+fn elapsed_secs(started: NaiveDateTime, now: NaiveDateTime) -> i64 {
+    (now - started).num_seconds().max(0)
 }
 
 /// Section of the combined list holding a row.
@@ -163,6 +177,12 @@ impl EditorState {
     pub fn field(&self) -> EditField {
         self.field
     }
+
+    /// The task snapshot the edit was opened from (id, day, done, and the
+    /// stored tracked total).
+    pub fn original(&self) -> &Task {
+        &self.original
+    }
 }
 
 /// Every event the app reacts to.
@@ -209,7 +229,12 @@ pub enum Message {
     CycleTagFilter,
     /// Clear the tag filter and restore the full list (`Esc`).
     ClearTagFilter,
-    Quit,
+    /// Toggle the work timer on the selected task (`w`). `now` rides along so
+    /// pure state never reads a clock. Starting while another task runs banks
+    /// the running task's elapsed seconds first (single running timer).
+    ToggleTimer(NaiveDateTime),
+    /// Quit, banking any running timer's elapsed seconds first.
+    Quit(NaiveDateTime),
 }
 
 /// Persistence work the runtime must perform after an update.
@@ -217,6 +242,11 @@ pub enum Message {
 pub enum Effect {
     SaveNew(NewTask),
     Update(Task),
+    /// Bank tracked seconds on a task (timer stop/switch/quit).
+    AddTrackedSecs {
+        task_id: i64,
+        delta_secs: i64,
+    },
     /// Reload the viewed day's list from storage (after navigation).
     Reload,
 }
@@ -241,6 +271,7 @@ pub struct App {
     mode: Mode,
     draft: String,
     editor: Option<EditorState>,
+    running: Option<RunningTimer>,
     calendar_focused: bool,
     cursor: NaiveDate,
     help_open: bool,
@@ -266,6 +297,7 @@ impl App {
             mode: Mode::Browse,
             draft: String::new(),
             editor: None,
+            running: None,
             calendar_focused: false,
             help_open: false,
             should_quit: false,
@@ -409,9 +441,7 @@ impl App {
     }
 
     /// Task under the selection cursor, if the visible (filtered) combined
-    /// list is non-empty. Used by detail flows from ticket #6; tests are
-    /// the first caller.
-    #[allow(dead_code)]
+    /// list is non-empty.
     pub fn selected_task(&self) -> Option<&Task> {
         let (section, row) = self.split_index(self.selected);
         self.filtered_in(section).into_iter().nth(row)
@@ -468,6 +498,23 @@ impl App {
     /// Whether the keybinding help overlay is open.
     pub fn help_open(&self) -> bool {
         self.help_open
+    }
+
+    /// Id of the task currently being timed, if any.
+    pub fn running_task_id(&self) -> Option<i64> {
+        self.running.as_ref().map(|running| running.task_id)
+    }
+
+    /// Tracked seconds to display for `task`: its stored total plus, when it
+    /// is the running task, the live elapsed segment. Never negative.
+    pub fn tracked_display(&self, task: &Task, now: NaiveDateTime) -> i64 {
+        let mut secs = task.tracked_secs.max(0);
+        if let Some(running) = &self.running
+            && running.task_id == task.id
+        {
+            secs += elapsed_secs(running.started, now);
+        }
+        secs
     }
 
     pub fn should_quit(&self) -> bool {
@@ -564,6 +611,50 @@ impl App {
         }
         let len = self.combined_len() as isize;
         self.selected = (self.selected as isize + step).rem_euclid(len) as usize;
+    }
+
+    /// Stop any running timer, emitting an effect that banks its elapsed
+    /// seconds. Idempotent: stopping when nothing runs emits nothing.
+    fn bank_running_timer(&mut self, now: NaiveDateTime) -> Vec<Effect> {
+        match self.running.take() {
+            Some(running) => vec![Effect::AddTrackedSecs {
+                task_id: running.task_id,
+                delta_secs: elapsed_secs(running.started, now),
+            }],
+            None => vec![],
+        }
+    }
+
+    /// Toggle timing on the selected task: stop if it is the running one;
+    /// otherwise bank the previous task's elapsed seconds and start here.
+    fn toggle_timer(&mut self, now: NaiveDateTime) -> Vec<Effect> {
+        let Some(selected_id) = self.selected_task().map(|task| task.id) else {
+            return vec![];
+        };
+        match self.running.take() {
+            Some(running) if running.task_id == selected_id => vec![Effect::AddTrackedSecs {
+                task_id: selected_id,
+                delta_secs: elapsed_secs(running.started, now),
+            }],
+            Some(running) => {
+                let banked = Effect::AddTrackedSecs {
+                    task_id: running.task_id,
+                    delta_secs: elapsed_secs(running.started, now),
+                };
+                self.running = Some(RunningTimer {
+                    task_id: selected_id,
+                    started: now,
+                });
+                vec![banked]
+            }
+            None => {
+                self.running = Some(RunningTimer {
+                    task_id: selected_id,
+                    started: now,
+                });
+                vec![]
+            }
+        }
     }
 
     /// Evolve state for one message, returning persistence effects
@@ -738,9 +829,11 @@ impl App {
                 self.clamp_selection();
                 vec![]
             }
-            Message::Quit => {
+            Message::ToggleTimer(now) => self.toggle_timer(now),
+            Message::Quit(now) => {
+                let effects = self.bank_running_timer(now);
                 self.should_quit = true;
-                vec![]
+                effects
             }
         }
     }
@@ -1035,8 +1128,97 @@ mod tests {
     fn quit_sets_should_quit() {
         let mut app = three_tasks();
         assert!(!app.should_quit());
-        app.update(Message::Quit);
+        app.update(Message::Quit(noon()));
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn timer_starts_and_emits_no_effect() {
+        let mut app = three_tasks();
+        assert_eq!(app.update(Message::ToggleTimer(noon())), vec![]);
+        assert_eq!(app.running_task_id(), Some(1));
+    }
+
+    #[test]
+    fn timer_on_empty_list_is_noop() {
+        let mut app = App::new(day(), vec![], vec![]);
+        assert_eq!(app.update(Message::ToggleTimer(noon())), vec![]);
+        assert_eq!(app.running_task_id(), None);
+    }
+
+    #[test]
+    fn timer_stop_banks_elapsed_seconds() {
+        let mut app = three_tasks();
+        app.update(Message::ToggleTimer(noon()));
+        let later = noon() + Duration::seconds(90);
+
+        let effects = app.update(Message::ToggleTimer(later));
+
+        assert_eq!(app.running_task_id(), None);
+        assert_eq!(
+            effects,
+            vec![Effect::AddTrackedSecs {
+                task_id: 1,
+                delta_secs: 90,
+            }]
+        );
+    }
+
+    #[test]
+    fn timer_switch_banks_previous_and_starts_new() {
+        let mut app = three_tasks();
+        app.update(Message::ToggleTimer(noon()));
+        app.update(Message::SelectNext);
+        let later = noon() + Duration::seconds(30);
+
+        let effects = app.update(Message::ToggleTimer(later));
+
+        assert_eq!(app.running_task_id(), Some(2));
+        assert_eq!(
+            effects,
+            vec![Effect::AddTrackedSecs {
+                task_id: 1,
+                delta_secs: 30,
+            }]
+        );
+    }
+
+    #[test]
+    fn timer_display_adds_live_elapsed_to_base_total() {
+        let mut app = three_tasks();
+        let mut stored = task(1, "one");
+        stored.tracked_secs = 60;
+        app.update(Message::ToggleTimer(noon()));
+        let later = noon() + Duration::seconds(45);
+
+        assert_eq!(app.tracked_display(&stored, later), 105);
+    }
+
+    #[test]
+    fn tracked_display_uses_stored_total_when_not_running() {
+        let app = three_tasks();
+        let mut stored = task(1, "one");
+        stored.tracked_secs = 120;
+        assert_eq!(app.tracked_display(&stored, noon()), 120);
+    }
+
+    #[test]
+    fn quit_banks_running_timer() {
+        let mut app = three_tasks();
+        app.update(Message::ToggleTimer(noon()));
+        let later = noon() + Duration::seconds(15);
+
+        let effects = app.update(Message::Quit(later));
+
+        assert!(app.should_quit());
+        assert_eq!(app.running_task_id(), None);
+        assert_eq!(
+            effects,
+            vec![Effect::AddTrackedSecs {
+                task_id: 1,
+                delta_secs: 15,
+            }]
+        );
     }
 
     #[test]

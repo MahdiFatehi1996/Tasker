@@ -1,15 +1,21 @@
 # Tasker
 
-A single-binary, offline, keyboard-driven daily task manager for the terminal, written in Rust.
+A single-binary, offline, keyboard-driven daily task manager for the terminal, written in Rust — with an amber-phosphor retro theme and a scriptable CLI.
 
-Each calendar day owns its own task list. Unfinished work never disappears: open tasks from past days automatically resurface in today's view as **Overdue**, still pinned to their original day. A month-grid **Calendar** jumps between days, and a built-in detail editor manages titles, priorities, and notes — no accounts, no network, no server. Everything lives in one local SQLite file.
+Each calendar day owns its own task list. Unfinished work never disappears: open tasks from past days automatically resurface in today's view as **Overdue**, still pinned to their original day. Deadlines get their own **Due today** and **Missed due** sections, with a desktop toast on launch for anything already late. Tasks carry **tags** you can filter by, and each task has a live **timer** that banks billable minutes across restarts. A month-grid **Calendar** jumps between days, and a built-in detail editor manages titles, priorities, due moments, tags, and notes — no accounts, no network, no server. Everything lives in one local SQLite file, and the same storage backs a non-interactive CLI for fast capture and export.
 
 ## Features
 
 - **Day lists** — one task list per calendar date; browse history and plan ahead
 - **Automatic carry-over** — overdue tasks surface in today's view flagged with their original day; completing one clears it
+- **Due moments** — set an exact due date-time; **Due today** and **Missed due** sections surface hard commitments, and a launch toast flags anything already past due
+- **Tags & filter** — attach multiple tags per task and cycle a one-tag filter to focus the whole list
+- **Live timer** — start/stop one task at a time with `w`; totals (`H:MM`) show on rows and in the editor and survive restarts
 - **Calendar pane** — month grid with keyboard cursor for jumping to any day
-- **Detail editor** — title, priority (low/medium/high), and free-text multiline notes, all in-app
+- **Detail editor** — title, priority (low/medium/high), due moment, tags, and free-text multiline notes, all in-app
+- **CLI companion** — `add` / `done` / `list` / `export` share the storage layer for capture without the TUI
+- **Export** — one-way JSON (full fidelity) and readable markdown, no data lock-in
+- **Amber-phosphor theme** — a single palette applied across every widget
 - **Local-first storage** — embedded SQLite, no setup beyond launching
 
 ## Install
@@ -82,19 +88,28 @@ Differences from Windows:
 
 - **Move** with `j`/`k` or `↑`/`↓`.
 - **Toggle** any task with `x` or `Space`.
+- **Start/stop a timer** with `w`. Only one timer runs at a time — starting on another task banks the first one's elapsed seconds first, and quitting banks the running segment. Totals show as `H:MM` on the row and in the editor.
 - **Edit** the selected task with `e` (or `Enter`). A panel opens:
-  - `Tab` / `Shift+Tab` switches between Title, Priority, and Notes.
+  - `Tab` / `Shift+Tab` switches between Title, Priority, Notes, Due, and Tags.
   - Type to edit; `Backspace` deletes.
   - `←`/`→` or `Space` cycles priority (low → medium → high → low).
+  - **Due** takes `YYYY-MM-DD HH:MM` (also `YYYY-MM-DDTHH:MM` or date-only for midnight); a blank clears it, and an invalid value keeps the panel open to fix.
+  - **Tags** are comma-separated (`work, admin`); blank clears them.
   - `Enter` saves — except in Notes, where it inserts a newline.
   - `Ctrl+S` saves from any field; `Esc` discards and closes.
 - Clearing a title to blank discards the edit instead of saving an empty task.
+
+### Tags, deadlines, and time
+
+- **Filter by tag** — press `f` to cycle through the tags in use; every section narrows to the active tag. Press `Esc` to clear. A filter pointing at a vanished tag clears itself.
+- **Deadlines** — a task with a due moment today appears under **Due today**; one already past under **Missed due**, flagged with its due moment. Completing it clears both. Launching the app fires a desktop toast for anything already past due.
+- **Timers** persist: accumulated seconds are stored, so closing and reopening never loses tracked time.
 
 ### Navigating days
 
 - **`[` / `]`** — previous / next day. The list reloads for the viewed day.
 - **`t`** — snap back to today.
-- **Calendar jumping** — press `Tab` to focus the calendar (yellow border), move the cursor with arrows or `hjkl` (`↑`/`↓` step a week), press `Enter` to jump the viewed day to the cursor, `Esc` to return focus to the list.
+- **Calendar jumping** — press `Tab` to focus the calendar (bright amber border), move the cursor with arrows or `hjkl` (`↑`/`↓` step a week), press `Enter` to jump the viewed day to the cursor, `Esc` to return focus to the list.
 - **Add to any day** — navigate somewhere else and press `a`; the new task is pinned to the viewed day.
 
 ### Overdue carry-over
@@ -105,13 +120,27 @@ Leave a task open overnight. Tomorrow it appears in an **Overdue** section above
 
 Press **`?`** anywhere in the main view for the full keybinding table. Press `?` or `Esc` to close it. While help is open, all other keys are frozen so nothing happens behind it by accident.
 
+## Command line
+
+A bare `tasker` launches the TUI; any subcommand runs non-interactively against the same database (same `--db` / `TASKER_DB` resolution) without opening the interface:
+
+```sh
+tasker add "Buy milk"                       # add a task to today
+tasker done 3                               # mark task 3 done
+tasker list                                 # print today's view (sections + rows)
+tasker export --format json                 # full-fidelity dump: every field, incl. tags, due, tracked seconds
+tasker export --format markdown --day 2026-10-08   # readable log of one day
+```
+
+`add`/`done` print a one-line confirmation; `list` mirrors the TUI's Missed-due / Due-today / Overdue / Today sections; `export` writes to stdout so you can pipe it anywhere. Argument errors print usage and exit non-zero.
+
 ## Data & files
 
 | What         | Where                                                      |
 | ------------ | ---------------------------------------------------------- |
 | Database     | `%APPDATA%\tasker\tasks.db` (override: `--db`, `TASKER_DB`) |
-| Single task  | id, day (`YYYY-MM-DD`), title, done, priority, notes        |
-| Schema       | Created on first launch; version marker reserved for migrations |
+| Single task  | id, day (`YYYY-MM-DD`), title, done, priority, notes, due, tracked seconds, tags |
+| Schema       | Created on first launch; version marker drives migrations (v1 → v2 adds due, tags, tracked seconds) |
 
 Back up by copying the `.db` file.
 
@@ -119,12 +148,15 @@ Back up by copying the `.db` file.
 
 ```text
 src/
-  main.rs    CLI args, startup, wiring
+  main.rs    CLI args, startup, dispatch (TUI vs subcommands)
+  cli.rs     Non-interactive surface: parse args → command; execute via storage
   app.rs     Pure state machine (messages → state + effects), unit-tested
-  db.rs      SQLite storage seam (day queries, overdue, save/update)
+  db.rs      SQLite storage seam (day queries, overdue, due, tags, timer)
+  model.rs   Domain types + formatting (tags, due input, H:MM totals)
+  theme.rs   Single amber-phosphor palette
   ui.rs      Ratatui render + event loop + keymap
 CONTEXT.md       Domain glossary
-docs/adr/        Architecture decisions (SQLite, ratatui TUI)
+docs/adr/        Architecture decisions (SQLite, ratatui TUI, CLI+TUI storage)
 docs/agents/     Agent-skill configuration (issue tracker, labels, domain)
 ```
 
