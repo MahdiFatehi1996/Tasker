@@ -21,7 +21,7 @@ use ratatui::{
 
 use crate::app::{App, EditField, EditorState, Effect, Message, Mode};
 use crate::db::Database;
-use crate::model::{Priority, Task};
+use crate::model::{Priority, Task, format_due_input};
 
 fn priority_letter(priority: Priority) -> char {
     match priority {
@@ -80,8 +80,9 @@ fn month_calendar(app: &App, today: NaiveDate) -> Monthly<'_, CalendarEventStore
 /// "N more above" indicator so the tail follows typing.
 const EDITOR_NOTES_VISIBLE: usize = 3;
 
-/// Editor panel height: borders + title + priority + notes label + visible lines.
-const EDITOR_PANEL_HEIGHT: u16 = 2 + 1 + 1 + 1 + EDITOR_NOTES_VISIBLE as u16;
+/// Editor panel height: borders + title + priority + notes label +
+/// visible lines + due row.
+const EDITOR_PANEL_HEIGHT: u16 = 2 + 1 + 1 + 1 + EDITOR_NOTES_VISIBLE as u16 + 1;
 
 /// Detail editor panel: focused field marked, text caret at the draft end.
 /// Notes show the last few lines so the tail follows typing.
@@ -121,6 +122,13 @@ fn editor_panel(editor: &EditorState) -> Paragraph<'_> {
         let focused = i + 1 == visible.len() && field == EditField::Notes;
         lines.push(Line::raw(format!("    {}", with_caret(line, focused))));
     }
+    lines.push(Line::from(vec![
+        Span::raw(marker(field == EditField::Due)),
+        Span::raw(format!(
+            "Due: {}",
+            with_caret(editor.due_text(), field == EditField::Due)
+        )),
+    ]));
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Edit"))
 }
 
@@ -133,9 +141,10 @@ fn with_caret(text: &str, focused: bool) -> String {
     }
 }
 
-/// One task row. `selected` drives the cursor marker; `original_day` (the
-/// pin of an overdue task) renders after the checkbox when present.
-fn task_row(task: &Task, selected: bool, original_day: Option<String>) -> ListItem<'_> {
+/// One task row. `selected` drives the cursor marker; `flag` (the day pin
+/// of an overdue task, or the due moment of a due-section task) renders
+/// after the checkbox when present.
+fn task_row(task: &Task, selected: bool, flag: Option<String>) -> ListItem<'_> {
     let marker = if selected { "> " } else { "  " };
     let checkbox = if task.done { "[x]" } else { "[ ]" };
     let row_style = if task.done {
@@ -147,7 +156,7 @@ fn task_row(task: &Task, selected: bool, original_day: Option<String>) -> ListIt
         Span::styled(marker, row_style),
         Span::styled(format!("{} ", checkbox), row_style),
     ];
-    if let Some(flag) = original_day {
+    if let Some(flag) = flag {
         spans.push(Span::styled(format!("[{}] ", flag), row_style));
     }
     spans.push(Span::styled(
@@ -157,8 +166,16 @@ fn task_row(task: &Task, selected: bool, original_day: Option<String>) -> ListIt
     ListItem::new(Line::from(spans))
 }
 
+/// Flag rendering a task's due moment in the due sections,
+/// mirroring the overdue `[YYYY-MM-DD]` pin flag.
+fn due_flag(task: &Task) -> Option<String> {
+    task.due
+        .map(|due| format!("due {}", format_due_input(&due)))
+}
+
 /// Draw one frame: calendar pane left, day-list column right
-/// (Overdue section when non-empty, viewed day, status footer).
+/// (Missed-due and Due-today sections when non-empty, Overdue section
+/// when non-empty, viewed day, status footer).
 fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
     let calendar = month_calendar(app, today);
     let outer = Layout::default()
@@ -182,6 +199,12 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
     );
 
     let mut constraints = Vec::new();
+    if !app.missed_due().is_empty() {
+        constraints.push(Constraint::Length(app.missed_due().len() as u16 + 2));
+    }
+    if !app.due_today().is_empty() {
+        constraints.push(Constraint::Length(app.due_today().len() as u16 + 2));
+    }
     if !app.overdue().is_empty() {
         constraints.push(Constraint::Length(app.overdue().len() as u16 + 2));
     }
@@ -196,6 +219,36 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         .split(outer[1]);
 
     let mut section = 0;
+    if !app.missed_due().is_empty() {
+        let cursor = app.missed_due_cursor();
+        let items: Vec<ListItem> = app
+            .missed_due()
+            .iter()
+            .enumerate()
+            .map(|(i, task)| task_row(task, Some(i) == cursor, due_flag(task)))
+            .collect();
+        let list =
+            List::new(items).block(Block::default().borders(Borders::ALL).title("Missed Due"));
+        let mut state = ListState::default();
+        state.select(cursor);
+        frame.render_stateful_widget(list, chunks[section], &mut state);
+        section += 1;
+    }
+    if !app.due_today().is_empty() {
+        let cursor = app.due_today_cursor();
+        let items: Vec<ListItem> = app
+            .due_today()
+            .iter()
+            .enumerate()
+            .map(|(i, task)| task_row(task, Some(i) == cursor, due_flag(task)))
+            .collect();
+        let list =
+            List::new(items).block(Block::default().borders(Borders::ALL).title("Due Today"));
+        let mut state = ListState::default();
+        state.select(cursor);
+        frame.render_stateful_widget(list, chunks[section], &mut state);
+        section += 1;
+    }
     if !app.overdue().is_empty() {
         let cursor = app.overdue_cursor();
         let items: Vec<ListItem> = app
@@ -252,7 +305,13 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
             Line::raw("Enter commit · Esc cancel"),
         ),
         Mode::Browse => {
-            let visible: Vec<&Task> = app.overdue().iter().chain(app.tasks()).collect();
+            let visible: Vec<&Task> = app
+                .missed_due()
+                .iter()
+                .chain(app.due_today())
+                .chain(app.overdue())
+                .chain(app.tasks())
+                .collect();
             let done = visible.iter().filter(|task| task.done).count();
             (
                 Line::raw(format!("{}/{} done", done, visible.len())),
@@ -328,6 +387,7 @@ fn help_text() -> Vec<Line<'static>> {
         Line::raw("Edit"),
         Line::raw("  Tab / Shift+Tab  switch field"),
         Line::raw("  Left/Right, Space cycle priority"),
+        Line::raw("  Due: YYYY-MM-DD HH:MM, blank clears"),
         Line::raw("  type, Backspace  edit field"),
         Line::raw("  Enter            commit (newline in notes)"),
         Line::raw("  Ctrl+S           save"),
@@ -457,10 +517,13 @@ fn event_loop(
                 }
             }
             app.set_tasks(db.tasks_for_day(app.viewed())?);
-            // Overdue is anchored to real today, never to the viewed day:
-            // browsing a past day must not hide it, and a future day must
-            // not promote today's tasks into it.
+            // Overdue and the due sections are anchored to real today, never
+            // to the viewed day: browsing a past day must not hide them, and
+            // a future day must not promote today's tasks into them.
             app.set_overdue(db.overdue_tasks(today)?);
+            app.set_due_today(db.due_today_tasks(today)?);
+            let now = Local::now().naive_local();
+            app.set_missed_due(db.missed_due_tasks(now)?);
         }
         if app.should_quit() {
             break;

@@ -135,3 +135,69 @@ pub fn normalize_tags(names: &[String]) -> Vec<String> {
 pub fn is_blank_title(title: &str) -> bool {
     title.trim().is_empty()
 }
+
+/// Display format for editing a due moment in the detail editor
+/// (`YYYY-MM-DD HH:MM`); a blank draft means no deadline.
+pub const DUE_INPUT_FORMAT: &str = "%Y-%m-%d %H:%M";
+
+/// Render a due moment for the editor draft.
+pub fn format_due_input(due: &NaiveDateTime) -> String {
+    due.format(DUE_INPUT_FORMAT).to_string()
+}
+
+/// Parse an editor due draft: blank clears (`Some(None)`), a valid
+/// `YYYY-MM-DD HH:MM` (also `YYYY-MM-DDTHH:MM` or date-only for midnight)
+/// sets (`Some(Some(..))`); anything else is `None` and the caller keeps
+/// the editor open so the typo can be fixed instead of saved.
+pub fn parse_due_input(s: &str) -> Option<Option<NaiveDateTime>> {
+    let text = s.trim();
+    if text.is_empty() {
+        return Some(None);
+    }
+    if let Ok(due) = NaiveDateTime::parse_from_str(text, DUE_INPUT_FORMAT) {
+        return Some(Some(due));
+    }
+    if let Ok(due) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M") {
+        return Some(Some(due));
+    }
+    if let Ok(day) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Some(Some(day.and_hms_opt(0, 0, 0).expect("midnight exists")));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noon() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 10, 10)
+            .expect("valid date")
+            .and_hms_opt(12, 30, 0)
+            .expect("valid datetime")
+    }
+
+    #[test]
+    fn due_input_round_trips_display_format() {
+        assert_eq!(format_due_input(&noon()), "2026-10-10 12:30");
+        assert_eq!(parse_due_input("2026-10-10 12:30"), Some(Some(noon())));
+    }
+
+    #[test]
+    fn due_input_accepts_variants_and_blank_clears() {
+        assert_eq!(parse_due_input("  "), Some(None));
+        assert_eq!(parse_due_input("2026-10-10T12:30"), Some(Some(noon())));
+        let midnight = NaiveDate::from_ymd_opt(2026, 10, 10)
+            .expect("valid date")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid datetime");
+        assert_eq!(parse_due_input("2026-10-10"), Some(Some(midnight)));
+    }
+
+    #[test]
+    fn due_input_rejects_garbage() {
+        assert_eq!(parse_due_input("soon"), None);
+        assert_eq!(parse_due_input("2026-13-10 12:30"), None);
+        assert_eq!(parse_due_input("12:30"), None);
+    }
+}

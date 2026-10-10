@@ -11,6 +11,7 @@ use chrono::Local;
 
 use app::App;
 use db::{Database, resolve_db_path};
+use model::format_due_input;
 
 /// Parse an optional `--db <path>` / `--db=<path>` argument.
 fn parse_db_arg(args: &[String]) -> Option<PathBuf> {
@@ -32,12 +33,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let path = resolve_db_path(parse_db_arg(&args));
     let database = Database::open(&path)?;
-    let today = Local::now().date_naive();
+    let now = Local::now().naive_local();
+    let today = now.date();
     let mut app = App::new(
         today,
         database.tasks_for_day(today)?,
         database.overdue_tasks(today)?,
     );
+    app.set_due_today(database.due_today_tasks(today)?);
+    let missed = database.missed_due_tasks(now)?;
+    notify_missed_due(&missed);
+    app.set_missed_due(missed);
     ui::run(&database, &mut app)?;
     Ok(())
+}
+
+/// One-shot launch toast: one desktop notification per task already past
+/// due. Best-effort — a headless session or missing notifier must never
+/// block startup, so delivery failures are ignored.
+fn notify_missed_due(missed: &[model::Task]) {
+    for task in missed {
+        let body = match task.due {
+            Some(due) => format!("{} (due {})", task.title, format_due_input(&due)),
+            None => task.title.clone(),
+        };
+        let _ = notify_rust::Notification::new()
+            .summary("Tasker — past due")
+            .body(&body)
+            .show();
+    }
 }

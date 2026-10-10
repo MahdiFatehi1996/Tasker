@@ -7,7 +7,7 @@
 
 use chrono::{Duration, NaiveDate};
 
-use crate::model::{NewTask, Priority, Task, is_blank_title};
+use crate::model::{NewTask, Priority, Task, format_due_input, is_blank_title, parse_due_input};
 
 /// Input mode: browsing the day list, composing a new task, or editing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -24,6 +24,7 @@ pub enum EditField {
     Title,
     Priority,
     Notes,
+    Due,
 }
 
 impl EditField {
@@ -31,17 +32,29 @@ impl EditField {
         match self {
             EditField::Title => EditField::Priority,
             EditField::Priority => EditField::Notes,
-            EditField::Notes => EditField::Title,
+            EditField::Notes => EditField::Due,
+            EditField::Due => EditField::Title,
         }
     }
 
     fn prev(self) -> EditField {
         match self {
-            EditField::Title => EditField::Notes,
+            EditField::Title => EditField::Due,
             EditField::Priority => EditField::Title,
             EditField::Notes => EditField::Priority,
+            EditField::Due => EditField::Notes,
         }
     }
+}
+
+/// Section of the combined list holding a row.
+/// Order matches the render: most urgent first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    MissedDue,
+    DueToday,
+    Overdue,
+    Today,
 }
 
 /// In-progress edit of one task: drafts plus the snapshot they came from
@@ -52,6 +65,7 @@ pub struct EditorState {
     title: String,
     priority: Priority,
     notes: String,
+    due_text: String,
     field: EditField,
 }
 
@@ -62,14 +76,22 @@ impl EditorState {
             title: task.title.clone(),
             priority: task.priority,
             notes: task.notes.clone(),
+            due_text: task.due.as_ref().map(format_due_input).unwrap_or_default(),
             field: EditField::Title,
         }
+    }
+
+    /// The due draft parsed: `None` means the text is not a valid due
+    /// moment (the commit path keeps the editor open to fix it).
+    fn parsed_due(&self) -> Option<Option<chrono::NaiveDateTime>> {
+        parse_due_input(&self.due_text)
     }
 
     fn has_changes(&self) -> bool {
         self.title.trim() != self.original.title
             || self.priority != self.original.priority
             || self.notes != self.original.notes
+            || self.parsed_due() != Some(self.original.due)
     }
 
     /// Step the focused field; wrapping both directions.
@@ -88,7 +110,7 @@ impl EditorState {
         }
     }
 
-    fn updated_task(&self) -> Task {
+    fn updated_task(&self, due: Option<chrono::NaiveDateTime>) -> Task {
         Task {
             id: self.original.id,
             day: self.original.day,
@@ -96,7 +118,7 @@ impl EditorState {
             done: self.original.done,
             priority: self.priority,
             notes: self.notes.clone(),
-            due: self.original.due,
+            due,
             tracked_secs: self.original.tracked_secs,
             tags: self.original.tags.clone(),
         }
@@ -104,6 +126,11 @@ impl EditorState {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Raw text of the due draft (`YYYY-MM-DD HH:MM`, blank for none).
+    pub fn due_text(&self) -> &str {
+        &self.due_text
     }
 
     pub fn priority(&self) -> Priority {
@@ -170,14 +197,18 @@ pub enum Effect {
     Reload,
 }
 
-/// In-memory state of the day-list view: today's tasks plus the
-/// Overdue section (open tasks from past days, still pinned to their
-/// original day). Selection spans the combined list, overdue first.
+/// In-memory state of the day-list view: today's tasks plus the derived
+/// sections — Missed-due (open + due before now), Due-today (open + due
+/// within today), and Overdue (open tasks from past days, still pinned to
+/// their original day). Selection spans the combined list, most urgent
+/// first: missed-due, due-today, overdue, then today.
 #[derive(Debug)]
 pub struct App {
     viewed: NaiveDate,
     tasks: Vec<Task>,
     overdue: Vec<Task>,
+    due_today: Vec<Task>,
+    missed_due: Vec<Task>,
     selected: usize,
     mode: Mode,
     draft: String,
@@ -190,12 +221,16 @@ pub struct App {
 
 impl App {
     /// Day list for `viewed`, freshly loaded with its overdue section.
+    /// Due sections start empty; the runtime fills them via
+    /// [`App::set_due_today`] and [`App::set_missed_due`] after loading.
     pub fn new(viewed: NaiveDate, tasks: Vec<Task>, overdue: Vec<Task>) -> App {
         let mut app = App {
             viewed,
             cursor: viewed,
             tasks: Vec::new(),
             overdue: Vec::new(),
+            due_today: Vec::new(),
+            missed_due: Vec::new(),
             selected: 0,
             mode: Mode::Browse,
             draft: String::new(),
@@ -222,6 +257,16 @@ impl App {
         &self.overdue
     }
 
+    /// Open tasks due within today, oldest due first.
+    pub fn due_today(&self) -> &[Task] {
+        &self.due_today
+    }
+
+    /// Open tasks past due, oldest due first.
+    pub fn missed_due(&self) -> &[Task] {
+        &self.missed_due
+    }
+
     /// Raw cursor over the combined list. Prefer the section cursors
     /// ([`App::overdue_cursor`], [`App::today_cursor`]) in new code;
     /// kept for tests asserting wrap-around positions.
@@ -230,25 +275,48 @@ impl App {
         self.selected
     }
 
-    /// Rows in the combined list (overdue first, then today).
+    /// Rows in the combined list (missed-due, due-today, overdue, today).
     fn combined_len(&self) -> usize {
-        self.overdue.len() + self.tasks.len()
+        self.missed_due.len() + self.due_today.len() + self.overdue.len() + self.tasks.len()
     }
 
-    /// Split a combined-list index into its section: `true` + row means an
-    /// overdue row, `false` + row means a today row.
-    fn split_index(&self, index: usize) -> (bool, usize) {
-        if index < self.overdue.len() {
-            (true, index)
-        } else {
-            (false, index - self.overdue.len())
+    /// Split a combined-list index into its section plus row.
+    fn split_index(&self, index: usize) -> (Section, usize) {
+        let mut rest = index;
+        for (section, len) in [
+            (Section::MissedDue, self.missed_due.len()),
+            (Section::DueToday, self.due_today.len()),
+            (Section::Overdue, self.overdue.len()),
+            (Section::Today, self.tasks.len()),
+        ] {
+            if rest < len {
+                return (section, rest);
+            }
+            rest -= len;
+        }
+        (Section::Today, rest)
+    }
+
+    /// Cursor row within the missed-due section, if it holds the selection.
+    pub fn missed_due_cursor(&self) -> Option<usize> {
+        match self.split_index(self.selected) {
+            (Section::MissedDue, row) if row < self.missed_due.len() => Some(row),
+            _ => None,
+        }
+    }
+
+    /// Cursor row within the due-today section, if it holds the selection.
+    pub fn due_today_cursor(&self) -> Option<usize> {
+        match self.split_index(self.selected) {
+            (Section::DueToday, row) if row < self.due_today.len() => Some(row),
+            _ => None,
         }
     }
 
     /// Cursor row within the overdue section, if it holds the selection.
     pub fn overdue_cursor(&self) -> Option<usize> {
         match self.split_index(self.selected) {
-            (true, row) if row < self.overdue.len() => Some(row),
+            (Section::Overdue, row) if row < self.overdue.len() => Some(row),
             _ => None,
         }
     }
@@ -256,7 +324,7 @@ impl App {
     /// Cursor row within today's list, if it holds the selection.
     pub fn today_cursor(&self) -> Option<usize> {
         match self.split_index(self.selected) {
-            (false, row) if row < self.tasks.len() => Some(row),
+            (Section::Today, row) if row < self.tasks.len() => Some(row),
             _ => None,
         }
     }
@@ -270,24 +338,29 @@ impl App {
     #[allow(dead_code)]
     pub fn selected_task(&self) -> Option<&Task> {
         match self.split_index(self.selected) {
-            (true, row) => self.overdue.get(row),
-            (false, row) => self.tasks.get(row),
+            (Section::MissedDue, row) => self.missed_due.get(row),
+            (Section::DueToday, row) => self.due_today.get(row),
+            (Section::Overdue, row) => self.overdue.get(row),
+            (Section::Today, row) => self.tasks.get(row),
         }
     }
 
     fn selected_task_mut(&mut self) -> Option<&mut Task> {
         match self.split_index(self.selected) {
-            (true, row) => self.overdue.get_mut(row),
-            (false, row) => self.tasks.get_mut(row),
+            (Section::MissedDue, row) => self.missed_due.get_mut(row),
+            (Section::DueToday, row) => self.due_today.get_mut(row),
+            (Section::Overdue, row) => self.overdue.get_mut(row),
+            (Section::Today, row) => self.tasks.get_mut(row),
         }
     }
 
-    /// Mutable text of the focused editor field (title/notes); None when the
-    /// editor is closed or the priority field is focused.
+    /// Mutable text of the focused editor field (title/notes/due); None when
+    /// the editor is closed or the priority field is focused.
     fn focused_text_mut(&mut self) -> Option<&mut String> {
         match self.editor.as_mut() {
             Some(editor) if editor.field == EditField::Title => Some(&mut editor.title),
             Some(editor) if editor.field == EditField::Notes => Some(&mut editor.notes),
+            Some(editor) if editor.field == EditField::Due => Some(&mut editor.due_text),
             _ => None,
         }
     }
@@ -338,6 +411,18 @@ impl App {
         self.clamp_selection();
     }
 
+    /// Replace the due-today section, keeping the selection valid.
+    pub fn set_due_today(&mut self, due_today: Vec<Task>) {
+        self.due_today = due_today;
+        self.clamp_selection();
+    }
+
+    /// Replace the missed-due section, keeping the selection valid.
+    pub fn set_missed_due(&mut self, missed_due: Vec<Task>) {
+        self.missed_due = missed_due;
+        self.clamp_selection();
+    }
+
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.draft.clear();
@@ -351,7 +436,14 @@ impl App {
 
     /// Commit the open edit, emitting an update only when drafts differ.
     /// An emptied title discards the edit, mirroring blank add commits.
+    /// A due draft that parses to nothing valid keeps the editor open so
+    /// the typo can be fixed instead of saved.
     fn commit_edit(&mut self) -> Vec<Effect> {
+        let due = match self.editor.as_ref().map(|editor| editor.parsed_due()) {
+            Some(Some(due)) => due,
+            Some(None) => return vec![],
+            None => return vec![],
+        };
         let Some(editor) = self.editor.take() else {
             return vec![];
         };
@@ -359,7 +451,7 @@ impl App {
         if is_blank_title(&editor.title) || !editor.has_changes() {
             return vec![];
         }
-        vec![Effect::Update(editor.updated_task())]
+        vec![Effect::Update(editor.updated_task(due))]
     }
     /// Make `day` the viewed day: cursor follows, list reloads via effect.
     fn goto_day(&mut self, day: NaiveDate) -> Vec<Effect> {
@@ -575,6 +667,31 @@ mod tests {
         let mut old = task(9, "old unfinished");
         old.day = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
         App::new(day(), vec![task(1, "one"), task(2, "two")], vec![old])
+    }
+
+    fn noon() -> chrono::NaiveDateTime {
+        day().and_hms_opt(12, 0, 0).expect("valid datetime")
+    }
+
+    fn due_task(id: i64, title: &str) -> Task {
+        Task {
+            due: Some(noon()),
+            ..task(id, title)
+        }
+    }
+
+    fn with_due_sections() -> App {
+        let mut app = App::new(day(), vec![task(1, "one")], vec![task(9, "old")]);
+        app.set_missed_due(vec![due_task(7, "missed work")]);
+        app.set_due_today(vec![due_task(8, "due work")]);
+        app
+    }
+
+    fn focus_due(app: &mut App) {
+        for _ in 0..3 {
+            app.update(Message::NextField);
+        }
+        assert_eq!(app.editor().expect("editor open").field, EditField::Due);
     }
 
     #[test]
@@ -969,9 +1086,11 @@ mod tests {
         app.update(Message::NextField);
         assert_eq!(app.editor().expect("editor open").field, EditField::Notes);
         app.update(Message::NextField);
+        assert_eq!(app.editor().expect("editor open").field, EditField::Due);
+        app.update(Message::NextField);
         assert_eq!(app.editor().expect("editor open").field, EditField::Title);
         app.update(Message::PrevField);
-        assert_eq!(app.editor().expect("editor open").field, EditField::Notes);
+        assert_eq!(app.editor().expect("editor open").field, EditField::Due);
     }
 
     #[test]
@@ -1093,6 +1212,166 @@ mod tests {
         assert_eq!(app.mode(), Mode::Browse);
         assert_eq!(app.editor(), None);
         assert_eq!(app.update(Message::CommitEdit), vec![]);
+    }
+
+    #[test]
+    fn due_sections_are_exposed_separately() {
+        let app = with_due_sections();
+        assert_eq!(app.missed_due().len(), 1);
+        assert_eq!(app.missed_due()[0].title, "missed work");
+        assert_eq!(app.due_today().len(), 1);
+        assert_eq!(app.due_today()[0].title, "due work");
+        assert_eq!(app.overdue().len(), 1);
+        assert_eq!(app.tasks().len(), 1);
+    }
+
+    #[test]
+    fn selection_spans_missed_due_today_overdue() {
+        let mut app = with_due_sections();
+        assert_eq!(
+            app.selected_task().map(|t| t.title.as_str()),
+            Some("missed work"),
+            "most urgent first"
+        );
+        app.update(Message::SelectNext);
+        assert_eq!(
+            app.selected_task().map(|t| t.title.as_str()),
+            Some("due work")
+        );
+        assert_eq!(app.due_today_cursor(), Some(0));
+        app.update(Message::SelectNext);
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("old"));
+        assert_eq!(app.overdue_cursor(), Some(0));
+        app.update(Message::SelectNext);
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("one"));
+        assert_eq!(app.today_cursor(), Some(0));
+        app.update(Message::SelectNext);
+        assert_eq!(app.missed_due_cursor(), Some(0), "selection wraps");
+    }
+
+    #[test]
+    fn toggle_due_task_flips_and_emits_update() {
+        let mut app = with_due_sections();
+
+        let effects = app.update(Message::ToggleSelected);
+
+        assert!(app.missed_due()[0].done);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0], Effect::Update(app.missed_due()[0].clone()));
+    }
+
+    #[test]
+    fn completing_due_task_then_reloading_clears_the_sections() {
+        let mut app = with_due_sections();
+        // Complete the missed-due task, then the due-today task.
+        app.update(Message::ToggleSelected);
+        app.update(Message::SelectNext);
+        app.update(Message::ToggleSelected);
+
+        app.set_missed_due(vec![]);
+        app.set_due_today(vec![]);
+
+        assert!(app.missed_due().is_empty());
+        assert!(app.due_today().is_empty());
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("one"));
+    }
+
+    #[test]
+    fn begin_edit_shows_due_draft() {
+        let mut app = with_due_sections();
+        app.update(Message::SelectNext);
+        assert_eq!(app.update(Message::BeginEdit), vec![]);
+        let editor = app.editor().expect("editor open");
+        assert_eq!(editor.due_text(), "2026-10-10 12:00");
+    }
+
+    #[test]
+    fn typing_in_due_field_edits_the_draft() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        focus_due(&mut app);
+        for c in "2026-10-11 09:00".chars() {
+            app.update(Message::EditChar(c));
+        }
+        assert_eq!(
+            app.editor().expect("editor open").due_text(),
+            "2026-10-11 09:00"
+        );
+        app.update(Message::EditBackspace);
+        assert_eq!(
+            app.editor().expect("editor open").due_text(),
+            "2026-10-11 09:0"
+        );
+    }
+
+    #[test]
+    fn commit_with_valid_due_sets_the_moment() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        focus_due(&mut app);
+        for c in "2026-10-11 09:00".chars() {
+            app.update(Message::EditChar(c));
+        }
+
+        let effects = app.update(Message::CommitEdit);
+
+        let expected_due = NaiveDate::from_ymd_opt(2026, 10, 11)
+            .expect("valid date")
+            .and_hms_opt(9, 0, 0)
+            .expect("valid datetime");
+        assert_eq!(
+            effects,
+            vec![Effect::Update(Task {
+                due: Some(expected_due),
+                ..task(1, "one")
+            })]
+        );
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn commit_with_blank_due_clears_the_moment() {
+        let mut app = with_due_sections();
+        app.update(Message::SelectNext);
+        begin_detail(&mut app);
+        focus_due(&mut app);
+        for _ in 0.."2026-10-10 12:00".len() {
+            app.update(Message::EditBackspace);
+        }
+        assert_eq!(app.editor().expect("editor open").due_text(), "");
+
+        let effects = app.update(Message::CommitEdit);
+
+        assert_eq!(
+            effects,
+            vec![Effect::Update(Task {
+                due: None,
+                ..due_task(8, "due work")
+            })]
+        );
+    }
+
+    #[test]
+    fn commit_with_invalid_due_keeps_the_editor_open() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        focus_due(&mut app);
+        for c in "soon".chars() {
+            app.update(Message::EditChar(c));
+        }
+
+        assert_eq!(app.update(Message::CommitEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Detail);
+        assert!(app.editor().is_some(), "typo can be fixed instead of saved");
+    }
+
+    #[test]
+    fn commit_unchanged_due_emits_nothing() {
+        let mut app = with_due_sections();
+        app.update(Message::SelectNext);
+        begin_detail(&mut app);
+        assert_eq!(app.update(Message::CommitEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Browse);
     }
 
     #[test]
