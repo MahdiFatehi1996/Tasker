@@ -54,6 +54,14 @@ pub struct Task {
     pub notes: String,
 }
 
+impl Task {
+    /// Flip the done state. Done is a toggle: completing and reopening
+    /// are the same operation.
+    pub fn toggle(&mut self) {
+        self.done = !self.done;
+    }
+}
+
 /// A task not yet stored: everything except id and done state.
 /// Constructed by add-flows from ticket #3; tests are the first caller.
 #[allow(dead_code)]

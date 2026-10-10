@@ -288,6 +288,49 @@ mod tests {
     }
 
     #[test]
+    fn tasks_for_day_returns_only_that_day() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let monday = NaiveDate::from_ymd_opt(2026, 10, 12).expect("valid date");
+        let tuesday = NaiveDate::from_ymd_opt(2026, 10, 13).expect("valid date");
+
+        for (day, title) in [(monday, "Monday work"), (tuesday, "Tuesday work")] {
+            db.save_task(&NewTask {
+                day,
+                title: title.to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+            })
+            .expect("save task");
+        }
+
+        let tasks = db.tasks_for_day(monday).expect("query monday");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Monday work");
+        assert_eq!(tasks[0].day, monday);
+    }
+
+    #[test]
+    fn toggled_done_survives_reopen() {
+        let path = temp_db_path();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 10).expect("valid date");
+
+        let db = Database::open(&path).expect("open file database");
+        db.save_task(&sample_task()).expect("save task");
+        let mut tasks = db.tasks_for_day(day).expect("query day");
+        assert!(!tasks[0].done);
+        tasks[0].done = true;
+        db.update_task(&tasks[0]).expect("toggle done");
+        drop(db);
+
+        let db = Database::open(&path).expect("reopen file database");
+        let tasks = db.tasks_for_day(day).expect("query day after reopen");
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].done, "toggled state survives a restart");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn update_task_persists_changes() {
         let db = memory_db();
         let day = test_day();
