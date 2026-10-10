@@ -1,1 +1,6 @@
 /target
+
+# Local-only working notes and agent config (not published).
+/AGENTS.md
+/CONTEXT.md
+/docs/

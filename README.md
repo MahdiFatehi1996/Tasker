@@ -155,9 +155,6 @@ src/
   model.rs   Domain types + formatting (tags, due input, H:MM totals)
   theme.rs   Single amber-phosphor palette
   ui.rs      Ratatui render + event loop + keymap
-CONTEXT.md       Domain glossary
-docs/adr/        Architecture decisions (SQLite, ratatui TUI, CLI+TUI storage)
-docs/agents/     Agent-skill configuration (issue tracker, labels, domain)
 ```
 
 ## Developing
@@ -180,4 +177,4 @@ cargo clippy --all-targets -- -D warnings   # lint gate
 cargo test                                  # full suite (storage + state-transition seams)
 ```
 
-Work is tracked in [GitHub Issues](https://github.com/MahdiFatehi1996/Tasker/issues). See `AGENTS.md` for the agent workflow.
+Work is tracked in [GitHub Issues](https://github.com/MahdiFatehi1996/Tasker/issues).
