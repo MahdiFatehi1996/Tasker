@@ -9,7 +9,7 @@
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::{
     Frame,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -19,7 +19,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, Effect, Message, Mode};
+use crate::app::{App, EditField, EditorState, Effect, Message, Mode};
 use crate::db::Database;
 use crate::model::{Priority, Task};
 
@@ -76,6 +76,63 @@ fn month_calendar(app: &App, today: NaiveDate) -> Monthly<'_, CalendarEventStore
         .show_month_header(Style::default().add_modifier(Modifier::BOLD))
 }
 
+/// Note lines visible in the editor panel; older lines collapse behind an
+/// "N more above" indicator so the tail follows typing.
+const EDITOR_NOTES_VISIBLE: usize = 3;
+
+/// Editor panel height: borders + title + priority + notes label + visible lines.
+const EDITOR_PANEL_HEIGHT: u16 = 2 + 1 + 1 + 1 + EDITOR_NOTES_VISIBLE as u16;
+
+/// Detail editor panel: focused field marked, text caret at the draft end.
+/// Notes show the last few lines so the tail follows typing.
+fn editor_panel(editor: &EditorState) -> Paragraph<'_> {
+    let marker = |focused: bool| if focused { "> " } else { "  " };
+    let field = editor.field();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw(marker(field == EditField::Title)),
+            Span::raw(format!(
+                "Title: {}",
+                with_caret(editor.title(), field == EditField::Title)
+            )),
+        ]),
+        Line::from(vec![
+            Span::raw(marker(field == EditField::Priority)),
+            Span::raw(format!("Priority: {}", editor.priority().as_str())),
+        ]),
+        Line::from(vec![
+            Span::raw(marker(field == EditField::Notes)),
+            Span::raw("Notes:"),
+        ]),
+    ];
+    let note_lines: Vec<&str> = editor.notes().split('\n').collect();
+    // Tail follows typing; an indicator replaces the oldest visible line
+    // when notes run longer than the panel.
+    let (start, show_indicator) = if note_lines.len() > EDITOR_NOTES_VISIBLE {
+        (note_lines.len() - (EDITOR_NOTES_VISIBLE - 1), true)
+    } else {
+        (0, false)
+    };
+    let visible = &note_lines[start..];
+    if show_indicator {
+        lines.push(Line::raw(format!("    ↑ {} more line(s) above", start)));
+    }
+    for (i, line) in visible.iter().enumerate() {
+        let focused = i + 1 == visible.len() && field == EditField::Notes;
+        lines.push(Line::raw(format!("    {}", with_caret(line, focused))));
+    }
+    Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Edit"))
+}
+
+/// Append the text caret when its field holds keyboard focus.
+fn with_caret(text: &str, focused: bool) -> String {
+    if focused {
+        format!("{}▌", text)
+    } else {
+        text.to_string()
+    }
+}
+
 /// One task row. `selected` drives the cursor marker; `original_day` (the
 /// pin of an overdue task) renders after the checkbox when present.
 fn task_row(task: &Task, selected: bool, original_day: Option<String>) -> ListItem<'_> {
@@ -129,6 +186,9 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
         constraints.push(Constraint::Length(app.overdue().len() as u16 + 2));
     }
     constraints.push(Constraint::Min(1));
+    if app.mode() == Mode::Detail {
+        constraints.push(Constraint::Length(EDITOR_PANEL_HEIGHT));
+    }
     constraints.push(Constraint::Length(2));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -172,6 +232,13 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
     frame.render_stateful_widget(list, chunks[section], &mut state);
     section += 1;
 
+    if app.mode() == Mode::Detail
+        && let Some(editor) = app.editor()
+    {
+        frame.render_widget(editor_panel(editor), chunks[section]);
+        section += 1;
+    }
+
     let (status, help) = match app.mode() {
         Mode::Adding => (
             Line::from(vec![
@@ -189,9 +256,15 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate) {
             let done = visible.iter().filter(|task| task.done).count();
             (
                 Line::raw(format!("{}/{} done", done, visible.len())),
-                Line::raw("j/k move · x toggle · a add · [ ] day · t today · Tab cal · q quit"),
+                Line::raw(
+                    "j/k move · x toggle · a add · e edit · [ ] day · t today · Tab cal · q quit",
+                ),
             )
         }
+        Mode::Detail => (
+            Line::raw("Enter commit/newline · Ctrl+S save"),
+            Line::raw("Tab field · ←/→ priority · Esc cancel"),
+        ),
     };
     frame.render_widget(Paragraph::new(vec![status, help]), chunks[section]);
 }
@@ -204,6 +277,22 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
             KeyCode::Enter => Some(Message::CommitAdd),
             KeyCode::Backspace => Some(Message::AddBackspace),
             KeyCode::Char(c) => Some(Message::AddChar(c)),
+            _ => None,
+        },
+        Mode::Detail => match key.code {
+            KeyCode::Esc => Some(Message::CancelEdit),
+            KeyCode::Enter => Some(Message::PressEnter),
+            KeyCode::Tab => Some(Message::NextField),
+            KeyCode::BackTab => Some(Message::PrevField),
+            KeyCode::Backspace => Some(Message::EditBackspace),
+            KeyCode::Left => Some(Message::CyclePriority(-1)),
+            KeyCode::Right => Some(Message::CyclePriority(1)),
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(Message::CommitEdit)
+            }
+            KeyCode::Char(c) => Some(Message::EditChar(c)),
             _ => None,
         },
         Mode::Browse => match key.code {
@@ -226,6 +315,7 @@ fn map_key(key: KeyEvent, mode: Mode, calendar_focused: bool, today: NaiveDate) 
                 KeyCode::Char('k') | KeyCode::Up => Some(Message::SelectPrev),
                 KeyCode::Char('x') | KeyCode::Char(' ') => Some(Message::ToggleSelected),
                 KeyCode::Char('a') => Some(Message::BeginAdd),
+                KeyCode::Char('e') | KeyCode::Enter => Some(Message::BeginEdit),
                 KeyCode::Tab => Some(Message::FocusCalendar),
                 _ => None,
             },
@@ -353,7 +443,11 @@ mod tests {
         );
         assert_eq!(
             map_key(press(KeyCode::Enter), Mode::Browse, false, today),
-            None
+            Some(Message::BeginEdit)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('e')), Mode::Browse, false, today),
+            Some(Message::BeginEdit)
         );
     }
 
@@ -434,6 +528,34 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Tab), Mode::Adding, false, today),
             None
+        );
+    }
+
+    #[test]
+    fn detail_keys_edit() {
+        let today = day();
+        let detail = |code| map_key(press(code), Mode::Detail, false, today);
+        assert_eq!(detail(KeyCode::Enter), Some(Message::PressEnter));
+        assert_eq!(detail(KeyCode::Esc), Some(Message::CancelEdit));
+        assert_eq!(detail(KeyCode::Tab), Some(Message::NextField));
+        assert_eq!(detail(KeyCode::BackTab), Some(Message::PrevField));
+        assert_eq!(detail(KeyCode::Left), Some(Message::CyclePriority(-1)));
+        assert_eq!(detail(KeyCode::Right), Some(Message::CyclePriority(1)));
+        assert_eq!(detail(KeyCode::Backspace), Some(Message::EditBackspace));
+        assert_eq!(detail(KeyCode::Char('z')), Some(Message::EditChar('z')));
+        assert_eq!(
+            detail(KeyCode::Char('q')),
+            Some(Message::EditChar('q')),
+            "no quit while editing"
+        );
+        assert_eq!(
+            map_key(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                Mode::Detail,
+                false,
+                today
+            ),
+            Some(Message::CommitEdit)
         );
     }
 }

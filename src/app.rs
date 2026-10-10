@@ -7,14 +7,113 @@
 
 use chrono::{Duration, NaiveDate};
 
-use crate::model::{NewTask, Priority, Task};
+use crate::model::{NewTask, Priority, Task, is_blank_title};
 
-/// Input mode: browsing the day list or composing a new task.
+/// Input mode: browsing the day list, composing a new task, or editing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
     Browse,
     Adding,
+    Detail,
+}
+
+/// Field focused in the detail editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditField {
+    Title,
+    Priority,
+    Notes,
+}
+
+impl EditField {
+    fn next(self) -> EditField {
+        match self {
+            EditField::Title => EditField::Priority,
+            EditField::Priority => EditField::Notes,
+            EditField::Notes => EditField::Title,
+        }
+    }
+
+    fn prev(self) -> EditField {
+        match self {
+            EditField::Title => EditField::Notes,
+            EditField::Priority => EditField::Title,
+            EditField::Notes => EditField::Priority,
+        }
+    }
+}
+
+/// In-progress edit of one task: drafts plus the snapshot they came from
+/// (id, day, and done state carry over untouched on commit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorState {
+    original: Task,
+    title: String,
+    priority: Priority,
+    notes: String,
+    field: EditField,
+}
+
+impl EditorState {
+    fn new(task: &Task) -> EditorState {
+        EditorState {
+            original: task.clone(),
+            title: task.title.clone(),
+            priority: task.priority,
+            notes: task.notes.clone(),
+            field: EditField::Title,
+        }
+    }
+
+    fn has_changes(&self) -> bool {
+        self.title.trim() != self.original.title
+            || self.priority != self.original.priority
+            || self.notes != self.original.notes
+    }
+
+    /// Step the focused field; wrapping both directions.
+    fn advance_field(&mut self, delta: i32) {
+        self.field = if delta >= 0 {
+            self.field.next()
+        } else {
+            self.field.prev()
+        };
+    }
+
+    /// Step priority; no-op unless the priority field is focused.
+    fn cycle_priority(&mut self, delta: i32) {
+        if self.field == EditField::Priority {
+            self.priority = self.priority.cycle(delta);
+        }
+    }
+
+    fn updated_task(&self) -> Task {
+        Task {
+            id: self.original.id,
+            day: self.original.day,
+            title: self.title.trim().to_string(),
+            done: self.original.done,
+            priority: self.priority,
+            notes: self.notes.clone(),
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    pub fn notes(&self) -> &str {
+        &self.notes
+    }
+
+    pub fn field(&self) -> EditField {
+        self.field
+    }
 }
 
 /// Every event the app reacts to.
@@ -40,6 +139,20 @@ pub enum Message {
     MoveCursor(i32),
     /// Make the cursor day the viewed day.
     JumpToCursor,
+    /// Open the detail editor for the selected task.
+    BeginEdit,
+    /// Type into the focused editor field (title/notes; space cycles priority).
+    EditChar(char),
+    EditBackspace,
+    /// Enter in the editor: newline in notes, commit elsewhere.
+    PressEnter,
+    NextField,
+    PrevField,
+    /// Step priority by delta; only applies while editing the priority field.
+    CyclePriority(i32),
+    /// Save the edit (only emits when drafts differ).
+    CommitEdit,
+    CancelEdit,
     Quit,
 }
 
@@ -63,6 +176,7 @@ pub struct App {
     selected: usize,
     mode: Mode,
     draft: String,
+    editor: Option<EditorState>,
     calendar_focused: bool,
     cursor: NaiveDate,
     should_quit: bool,
@@ -79,6 +193,7 @@ impl App {
             selected: 0,
             mode: Mode::Browse,
             draft: String::new(),
+            editor: None,
             calendar_focused: false,
             should_quit: false,
         };
@@ -160,12 +275,27 @@ impl App {
         }
     }
 
+    /// Mutable text of the focused editor field (title/notes); None when the
+    /// editor is closed or the priority field is focused.
+    fn focused_text_mut(&mut self) -> Option<&mut String> {
+        match self.editor.as_mut() {
+            Some(editor) if editor.field == EditField::Title => Some(&mut editor.title),
+            Some(editor) if editor.field == EditField::Notes => Some(&mut editor.notes),
+            _ => None,
+        }
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
 
     pub fn draft(&self) -> &str {
         &self.draft
+    }
+
+    /// The in-progress edit, if the detail editor is open.
+    pub fn editor(&self) -> Option<&EditorState> {
+        self.editor.as_ref()
     }
 
     /// Whether keyboard focus is in the calendar pane.
@@ -207,6 +337,18 @@ impl App {
             .unwrap_or(day)
     }
 
+    /// Commit the open edit, emitting an update only when drafts differ.
+    /// An emptied title discards the edit, mirroring blank add commits.
+    fn commit_edit(&mut self) -> Vec<Effect> {
+        let Some(editor) = self.editor.take() else {
+            return vec![];
+        };
+        self.set_mode(Mode::Browse);
+        if is_blank_title(&editor.title) || !editor.has_changes() {
+            return vec![];
+        }
+        vec![Effect::Update(editor.updated_task())]
+    }
     /// Make `day` the viewed day: cursor follows, list reloads via effect.
     fn goto_day(&mut self, day: NaiveDate) -> Vec<Effect> {
         self.viewed = day;
@@ -266,7 +408,7 @@ impl App {
             Message::CommitAdd => {
                 let title = self.draft.trim().to_string();
                 self.set_mode(Mode::Browse);
-                if title.is_empty() {
+                if is_blank_title(&title) {
                     vec![]
                 } else {
                     vec![Effect::SaveNew(NewTask {
@@ -305,6 +447,73 @@ impl App {
                 }
                 self.calendar_focused = false;
                 self.goto_day(self.cursor)
+            }
+            Message::BeginEdit => match self.selected_task().cloned() {
+                Some(task) => {
+                    self.editor = Some(EditorState::new(&task));
+                    self.set_mode(Mode::Detail);
+                    vec![]
+                }
+                None => vec![],
+            },
+            Message::EditChar(c) => {
+                let in_priority = matches!(
+                    self.editor.as_ref(),
+                    Some(editor) if editor.field == EditField::Priority
+                );
+                if in_priority {
+                    if c == ' '
+                        && let Some(editor) = self.editor.as_mut()
+                    {
+                        editor.cycle_priority(1);
+                    }
+                } else if let Some(text) = self.focused_text_mut() {
+                    text.push(c);
+                }
+                vec![]
+            }
+            Message::EditBackspace => {
+                if let Some(text) = self.focused_text_mut() {
+                    let _ = text.pop();
+                }
+                vec![]
+            }
+            Message::PressEnter => {
+                let in_notes = matches!(self.editor.as_ref(), Some(editor) if editor.field == EditField::Notes);
+                if in_notes {
+                    self.focused_text_mut()
+                        .expect("notes field holds text")
+                        .push('\n');
+                    vec![]
+                } else {
+                    self.commit_edit()
+                }
+            }
+            Message::NextField => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.advance_field(1);
+                }
+                vec![]
+            }
+            Message::PrevField => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.advance_field(-1);
+                }
+                vec![]
+            }
+            Message::CyclePriority(delta) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.cycle_priority(delta);
+                }
+                vec![]
+            }
+            Message::CommitEdit => self.commit_edit(),
+            Message::CancelEdit => {
+                if self.editor.is_some() {
+                    self.editor = None;
+                    self.set_mode(Mode::Browse);
+                }
+                vec![]
             }
             Message::Quit => {
                 self.should_quit = true;
@@ -677,5 +886,184 @@ mod tests {
                 notes: String::new(),
             })]
         );
+    }
+
+    fn begin_detail(app: &mut App) {
+        assert_eq!(app.update(Message::BeginEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Detail);
+    }
+
+    #[test]
+    fn begin_edit_opens_detail_with_snapshot() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        let editor = app.editor().expect("editor open");
+        assert_eq!(editor.title, "one");
+        assert_eq!(editor.priority, Priority::Medium);
+        assert_eq!(editor.notes, "");
+        assert_eq!(editor.field, EditField::Title);
+    }
+
+    #[test]
+    fn begin_edit_empty_list_is_noop() {
+        let mut app = App::new(day(), vec![], vec![]);
+        assert_eq!(app.update(Message::BeginEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Browse);
+        assert_eq!(app.editor(), None);
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_title() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        app.update(Message::EditChar('!'));
+        assert_eq!(app.editor().expect("editor open").title, "one!");
+        app.update(Message::EditBackspace);
+        app.update(Message::EditBackspace);
+        assert_eq!(app.editor().expect("editor open").title, "on");
+    }
+
+    #[test]
+    fn edit_messages_outside_detail_are_ignored() {
+        let mut app = three_tasks();
+        assert_eq!(app.update(Message::EditChar('x')), vec![]);
+        assert_eq!(app.update(Message::CommitEdit), vec![]);
+        assert_eq!(app.update(Message::CancelEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn fields_cycle_forward_and_back() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        app.update(Message::NextField);
+        assert_eq!(
+            app.editor().expect("editor open").field,
+            EditField::Priority
+        );
+        app.update(Message::NextField);
+        assert_eq!(app.editor().expect("editor open").field, EditField::Notes);
+        app.update(Message::NextField);
+        assert_eq!(app.editor().expect("editor open").field, EditField::Title);
+        app.update(Message::PrevField);
+        assert_eq!(app.editor().expect("editor open").field, EditField::Notes);
+    }
+
+    #[test]
+    fn priority_cycles_and_wraps() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        app.update(Message::NextField);
+        app.update(Message::CyclePriority(1));
+        assert_eq!(app.editor().expect("editor open").priority, Priority::High);
+        app.update(Message::CyclePriority(1));
+        assert_eq!(app.editor().expect("editor open").priority, Priority::Low);
+        app.update(Message::CyclePriority(-1));
+        assert_eq!(app.editor().expect("editor open").priority, Priority::High);
+    }
+
+    #[test]
+    fn chars_ignored_in_priority_except_space() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        app.update(Message::NextField);
+        app.update(Message::EditChar('a'));
+        assert_eq!(
+            app.editor().expect("editor open").priority,
+            Priority::Medium
+        );
+        app.update(Message::EditChar(' '));
+        assert_eq!(app.editor().expect("editor open").priority, Priority::High);
+    }
+
+    #[test]
+    fn newline_in_notes_inserts_but_commits_in_title() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        app.update(Message::NextField);
+        app.update(Message::NextField);
+        app.update(Message::EditChar('a'));
+        app.update(Message::PressEnter);
+        app.update(Message::EditChar('b'));
+        assert_eq!(app.editor().expect("editor open").notes, "a\nb");
+        assert_eq!(app.mode(), Mode::Detail);
+
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        let effects = app.update(Message::PressEnter);
+        assert_eq!(effects, vec![], "unchanged title commits silently");
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn commit_unchanged_emits_nothing() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        assert_eq!(app.update(Message::CommitEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Browse);
+        assert_eq!(app.editor(), None);
+    }
+
+    #[test]
+    fn commit_with_emptied_title_discards() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        for _ in 0..3 {
+            app.update(Message::EditBackspace);
+        }
+        assert_eq!(app.editor().expect("editor open").title, "");
+        assert_eq!(app.update(Message::CommitEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn commit_with_whitespace_only_change_emits_nothing() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        app.update(Message::EditChar(' '));
+        assert_eq!(app.update(Message::CommitEdit), vec![]);
+    }
+
+    #[test]
+    fn commit_changed_emits_update() {
+        let mut app = three_tasks();
+        app.update(Message::SelectNext);
+        begin_detail(&mut app);
+        for c in " edited".chars() {
+            app.update(Message::EditChar(c));
+        }
+        app.update(Message::NextField);
+        app.update(Message::CyclePriority(1));
+        app.update(Message::NextField);
+        for c in "some notes".chars() {
+            app.update(Message::EditChar(c));
+        }
+
+        let effects = app.update(Message::CommitEdit);
+
+        assert_eq!(
+            effects,
+            vec![Effect::Update(Task {
+                id: 2,
+                day: day(),
+                title: "two edited".to_string(),
+                done: false,
+                priority: Priority::High,
+                notes: "some notes".to_string(),
+            })]
+        );
+        assert_eq!(app.mode(), Mode::Browse);
+        assert_eq!(app.editor(), None);
+    }
+
+    #[test]
+    fn cancel_discards_and_later_commit_is_noop() {
+        let mut app = three_tasks();
+        begin_detail(&mut app);
+        app.update(Message::EditChar('x'));
+        assert_eq!(app.update(Message::CancelEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Browse);
+        assert_eq!(app.editor(), None);
+        assert_eq!(app.update(Message::CommitEdit), vec![]);
     }
 }

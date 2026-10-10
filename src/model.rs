@@ -41,6 +41,17 @@ impl Priority {
             .find(|(_, name)| *name == needle)
             .map(|(priority, _)| priority)
     }
+
+    /// Step through low → medium → high, wrapping around.
+    pub fn cycle(self, delta: i32) -> Priority {
+        let order = [Priority::Low, Priority::Medium, Priority::High];
+        let index = order
+            .into_iter()
+            .position(|p| p == self)
+            .expect("every priority is in the cycle");
+        let len = order.len() as i32;
+        order[(index as i32 + delta).rem_euclid(len) as usize]
+    }
 }
 
 /// A task pinned to a calendar day.
@@ -71,4 +82,10 @@ pub struct NewTask {
     pub title: String,
     pub priority: Priority,
     pub notes: String,
+}
+
+/// Titles that are empty or whitespace-only can never be committed —
+/// shared by add commits and edit commits so the rule lives once.
+pub fn is_blank_title(title: &str) -> bool {
+    title.trim().is_empty()
 }
