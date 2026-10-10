@@ -5,7 +5,7 @@
 //! against the [`Database`](crate::db::Database) and reloads the day list.
 //! Tests assert on states and effects only.
 
-use chrono::NaiveDate;
+use chrono::{Duration, NaiveDate};
 
 use crate::model::{NewTask, Priority, Task};
 
@@ -28,6 +28,18 @@ pub enum Message {
     AddBackspace,
     CommitAdd,
     CancelAdd,
+    ViewPrevDay,
+    ViewNextDay,
+    /// Return to today. The date rides along so pure state never reads a clock.
+    ViewToday(NaiveDate),
+    /// Move keyboard focus into the calendar pane; cursor starts on viewed.
+    FocusCalendar,
+    /// Move keyboard focus back to the day list.
+    FocusList,
+    /// Move the calendar cursor by a day delta (-1/+1 day, -7/+7 week).
+    MoveCursor(i32),
+    /// Make the cursor day the viewed day.
+    JumpToCursor,
     Quit,
 }
 
@@ -36,6 +48,8 @@ pub enum Message {
 pub enum Effect {
     SaveNew(NewTask),
     Update(Task),
+    /// Reload the viewed day's list from storage (after navigation).
+    Reload,
 }
 
 /// In-memory state of the day-list view: today's tasks plus the
@@ -49,6 +63,8 @@ pub struct App {
     selected: usize,
     mode: Mode,
     draft: String,
+    calendar_focused: bool,
+    cursor: NaiveDate,
     should_quit: bool,
 }
 
@@ -57,11 +73,13 @@ impl App {
     pub fn new(viewed: NaiveDate, tasks: Vec<Task>, overdue: Vec<Task>) -> App {
         let mut app = App {
             viewed,
+            cursor: viewed,
             tasks: Vec::new(),
             overdue: Vec::new(),
             selected: 0,
             mode: Mode::Browse,
             draft: String::new(),
+            calendar_focused: false,
             should_quit: false,
         };
         app.set_tasks(tasks);
@@ -150,6 +168,16 @@ impl App {
         &self.draft
     }
 
+    /// Whether keyboard focus is in the calendar pane.
+    pub fn calendar_focused(&self) -> bool {
+        self.calendar_focused
+    }
+
+    /// The calendar cursor day.
+    pub fn cursor(&self) -> NaiveDate {
+        self.cursor
+    }
+
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -171,6 +199,25 @@ impl App {
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.draft.clear();
+    }
+
+    /// Shift a day, saturating at the calendar edge (unreachable in practice).
+    fn shift_day(day: NaiveDate, delta: i32) -> NaiveDate {
+        day.checked_add_signed(Duration::days(delta as i64))
+            .unwrap_or(day)
+    }
+
+    /// Make `day` the viewed day: cursor follows, list reloads via effect.
+    fn goto_day(&mut self, day: NaiveDate) -> Vec<Effect> {
+        self.viewed = day;
+        self.cursor = day;
+        vec![Effect::Reload]
+    }
+
+    /// Step the viewed day by a day delta (month edges handled by chrono).
+    fn step_viewed(&mut self, delta: i32) -> Vec<Effect> {
+        let day = Self::shift_day(self.viewed, delta);
+        self.goto_day(day)
     }
 
     fn move_selection(&mut self, step: isize) {
@@ -233,6 +280,31 @@ impl App {
             Message::CancelAdd => {
                 self.set_mode(Mode::Browse);
                 vec![]
+            }
+            Message::ViewPrevDay => self.step_viewed(-1),
+            Message::ViewNextDay => self.step_viewed(1),
+            Message::ViewToday(today) => self.goto_day(today),
+            Message::FocusCalendar => {
+                self.calendar_focused = true;
+                self.cursor = self.viewed;
+                vec![]
+            }
+            Message::FocusList => {
+                self.calendar_focused = false;
+                vec![]
+            }
+            Message::MoveCursor(delta) => {
+                if self.calendar_focused {
+                    self.cursor = Self::shift_day(self.cursor, delta);
+                }
+                vec![]
+            }
+            Message::JumpToCursor => {
+                if !self.calendar_focused {
+                    return vec![];
+                }
+                self.calendar_focused = false;
+                self.goto_day(self.cursor)
             }
             Message::Quit => {
                 self.should_quit = true;
@@ -475,5 +547,135 @@ mod tests {
         assert!(!app.should_quit());
         app.update(Message::Quit);
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn view_next_day_advances_and_emits_reload() {
+        let mut app = three_tasks();
+        let effects = app.update(Message::ViewNextDay);
+        assert_eq!(
+            app.viewed(),
+            NaiveDate::from_ymd_opt(2026, 10, 11).expect("valid date")
+        );
+        assert_eq!(effects, vec![Effect::Reload]);
+    }
+
+    #[test]
+    fn view_prev_day_crosses_month_boundary() {
+        let mut app = App::new(
+            NaiveDate::from_ymd_opt(2026, 10, 1).expect("valid date"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(app.update(Message::ViewPrevDay), vec![Effect::Reload]);
+        assert_eq!(
+            app.viewed(),
+            NaiveDate::from_ymd_opt(2026, 9, 30).expect("valid date")
+        );
+    }
+
+    #[test]
+    fn view_next_day_crosses_month_boundary() {
+        let mut app = App::new(
+            NaiveDate::from_ymd_opt(2026, 10, 31).expect("valid date"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(app.update(Message::ViewNextDay), vec![Effect::Reload]);
+        assert_eq!(
+            app.viewed(),
+            NaiveDate::from_ymd_opt(2026, 11, 1).expect("valid date")
+        );
+    }
+
+    #[test]
+    fn view_today_returns_with_payload() {
+        let mut app = three_tasks();
+        app.update(Message::ViewNextDay);
+        let today = NaiveDate::from_ymd_opt(2026, 10, 10).expect("valid date");
+        assert_eq!(app.update(Message::ViewToday(today)), vec![Effect::Reload]);
+        assert_eq!(app.viewed(), today);
+    }
+
+    #[test]
+    fn navigation_syncs_cursor() {
+        let mut app = three_tasks();
+        app.update(Message::ViewNextDay);
+        assert_eq!(app.cursor(), app.viewed());
+    }
+
+    #[test]
+    fn focus_calendar_sets_cursor_to_viewed() {
+        let mut app = three_tasks();
+        app.update(Message::ViewNextDay);
+        assert!(!app.calendar_focused());
+        assert_eq!(app.update(Message::FocusCalendar), vec![]);
+        assert!(app.calendar_focused());
+        assert_eq!(app.cursor(), app.viewed());
+    }
+
+    #[test]
+    fn move_cursor_steps_by_delta() {
+        let mut app = three_tasks();
+        app.update(Message::FocusCalendar);
+        app.update(Message::MoveCursor(1));
+        assert_eq!(
+            app.cursor(),
+            NaiveDate::from_ymd_opt(2026, 10, 11).expect("valid date")
+        );
+        app.update(Message::MoveCursor(-7));
+        assert_eq!(
+            app.cursor(),
+            NaiveDate::from_ymd_opt(2026, 10, 4).expect("valid date")
+        );
+        assert_eq!(app.viewed(), day(), "cursor moves do not navigate");
+    }
+
+    #[test]
+    fn move_cursor_ignored_when_list_focused() {
+        let mut app = three_tasks();
+        app.update(Message::MoveCursor(5));
+        assert_eq!(app.cursor(), day());
+    }
+
+    #[test]
+    fn jump_to_cursor_sets_viewed_and_emits_reload() {
+        let mut app = three_tasks();
+        app.update(Message::FocusCalendar);
+        app.update(Message::MoveCursor(9));
+        let effects = app.update(Message::JumpToCursor);
+        assert_eq!(
+            app.viewed(),
+            NaiveDate::from_ymd_opt(2026, 10, 19).expect("valid date")
+        );
+        assert_eq!(effects, vec![Effect::Reload]);
+        assert!(!app.calendar_focused(), "jump returns focus to the list");
+    }
+
+    #[test]
+    fn jump_ignored_when_list_focused() {
+        let mut app = three_tasks();
+        assert_eq!(app.update(Message::JumpToCursor), vec![]);
+        assert_eq!(app.viewed(), day());
+    }
+
+    #[test]
+    fn commit_add_targets_viewed_day() {
+        let past = NaiveDate::from_ymd_opt(2026, 10, 5).expect("valid date");
+        let mut app = App::new(past, vec![], vec![]);
+        app.update(Message::BeginAdd);
+        for c in "past work".chars() {
+            app.update(Message::AddChar(c));
+        }
+        let effects = app.update(Message::CommitAdd);
+        assert_eq!(
+            effects,
+            vec![Effect::SaveNew(NewTask {
+                day: past,
+                title: "past work".to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+            })]
+        );
     }
 }
