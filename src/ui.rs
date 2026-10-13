@@ -371,6 +371,77 @@ fn day_sections(app: &App) -> Vec<(Section, Vec<Task>)> {
         .collect()
 }
 
+/// One Summary figure: a dim label and a strong value.
+fn summary_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), theme::dim()),
+        Span::styled(value, theme::strong()),
+    ])
+}
+
+/// Rendered row count of one section; an omitted (empty) derived section
+/// counts as zero.
+fn section_count(sections: &[(Section, Vec<Task>)], wanted: Section) -> usize {
+    sections
+        .iter()
+        .find(|(section, _)| *section == wanted)
+        .map_or(0, |(_, rows)| rows.len())
+}
+
+/// The Summary block: a read-out of the sections rendered beside it. Every
+/// figure derives from `sections` — the single [`day_sections`] list the
+/// day-list column draws from — so the Summary can never disagree with the
+/// rows on screen. The title names the active tag filter, whose narrowing is
+/// already reflected in those rows; the tracked total sums the live display
+/// of every rendered row, so a running Timer's segment is included.
+fn summary_panel(
+    app: &App,
+    sections: &[(Section, Vec<Task>)],
+    now: NaiveDateTime,
+) -> Paragraph<'static> {
+    let today_rows = sections
+        .iter()
+        .find(|(section, _)| *section == Section::Today)
+        .map_or(&[][..], |(_, rows)| rows.as_slice());
+    let done = today_rows.iter().filter(|task| task.done).count();
+    let total = today_rows.len();
+    let tracked: i64 = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .map(|task| app.tracked_display(task, now))
+        .sum();
+    let high_open = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .filter(|task| !task.done && task.priority == Priority::High)
+        .count();
+
+    let title = match app.tag_filter() {
+        Some(tag) => format!("Summary — #{tag}"),
+        None => "Summary".to_string(),
+    };
+    let lines = vec![
+        summary_line(
+            "Missed due",
+            section_count(sections, Section::MissedDue).to_string(),
+        ),
+        summary_line(
+            "Due today",
+            section_count(sections, Section::DueToday).to_string(),
+        ),
+        summary_line(
+            "Overdue",
+            section_count(sections, Section::Overdue).to_string(),
+        ),
+        summary_line("Done", format!("{done}/{total}")),
+        summary_line("Tracked", format_tracked(tracked)),
+        summary_line("High open", high_open.to_string()),
+    ];
+    Paragraph::new(lines)
+        .style(theme::text())
+        .block(section_block(&title, theme::strong()))
+}
+
 /// Draw one frame: calendar pane left, day-list column right
 /// (Missed-due and Due-today sections when non-empty, Overdue section
 /// when non-empty, viewed day, status footer).
@@ -384,6 +455,15 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(calendar.width() + 2), Constraint::Min(1)])
         .split(frame.area());
+
+    // The left column stacks the Calendar above the always-visible Summary.
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(calendar.height() + 2),
+            Constraint::Min(1),
+        ])
+        .split(outer[0]);
 
     let border_style = if app.calendar_focused() {
         theme::focused_block()
@@ -399,13 +479,14 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
                 .border_style(border_style)
                 .style(theme::text()),
         ),
-        outer[0],
+        left[0],
     );
 
     // One shared path draws every section: order, titles, and flags come from
     // [`day_sections`], so an active tag filter narrows the whole column at
     // once. A derived section with no rows is omitted.
     let sections = day_sections(app);
+    frame.render_widget(summary_panel(app, &sections, now), left[1]);
 
     let mut constraints: Vec<Constraint> = sections
         .iter()
@@ -461,26 +542,24 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
             Line::styled("Enter commit · Esc cancel", theme::dim()),
         ),
         Mode::Browse => {
-            let total: usize = sections.iter().map(|(_, rows)| rows.len()).sum();
-            let done = sections
-                .iter()
-                .flat_map(|(_, rows)| rows)
-                .filter(|task| task.done)
-                .count();
-            let status = match app.tag_filter() {
-                Some(tag) => format!("[#{tag}] {done}/{total} done"),
-                None => format!("{done}/{total} done"),
-            };
-            let status_style = if sections
+            // The Summary carries the figures now; the status line keeps only
+            // the Missed-due warning (in its error colour) and the active tag
+            // filter, so no number is displayed twice.
+            let mut status: Vec<Span> = Vec::new();
+            if sections
                 .iter()
                 .any(|(section, _)| *section == Section::MissedDue)
             {
-                theme::alert()
-            } else {
-                theme::strong()
-            };
+                status.push(Span::styled("⚠ Missed due", theme::alert()));
+            }
+            if let Some(tag) = app.tag_filter() {
+                if !status.is_empty() {
+                    status.push(Span::styled(" · ", theme::dim()));
+                }
+                status.push(Span::styled(format!("[#{tag}]"), theme::strong()));
+            }
             (
-                Line::styled(status, status_style),
+                Line::from(status),
                 Line::styled(
                     "j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · [ ] day · t today · Tab cal · ? help · q quit",
                     theme::dim(),
@@ -1020,6 +1099,122 @@ mod tests {
         app.set_missed_due(vec![due_task(7, "missed work")]);
         app.set_due_today(vec![due_task(8, "due work")]);
         app
+    }
+
+    /// Every section populated with known figures: two missed due, one due
+    /// today, one overdue, two viewed-day rows (one done), tracked seconds
+    /// everywhere, and one open high-Priority task. The timer is running on
+    /// the first viewed-day row from `start`, so its live segment is real.
+    fn summary_app(start: NaiveDateTime) -> App {
+        let mut open_high = task(1, "open high");
+        open_high.priority = Priority::High;
+        open_high.tracked_secs = 3600; // 1:00
+        let mut done_high = task(2, "done high");
+        done_high.priority = Priority::High;
+        done_high.done = true;
+        done_high.tracked_secs = 600; // 0:10
+
+        let mut app = App::new(day(), vec![open_high, done_high], vec![]);
+        app.update(Message::ToggleTimer(start)); // times task 1
+        app.set_overdue(vec![task(9, "old")]);
+        app.set_missed_due(vec![due_task(7, "missed"), due_task(6, "missed too")]);
+        app.set_due_today(vec![due_task(8, "due")]);
+        app
+    }
+
+    /// The bottom two rows of a rendered frame: the status line and the
+    /// keybinding hints.
+    fn footer_text(text: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len() - 2..].join("\n")
+    }
+
+    #[test]
+    fn headless_frame_shows_the_summary_block() {
+        let text = buffer_text(&render_frame(&smoke_app(), noon()));
+        assert!(
+            text.contains("Summary"),
+            "the Summary is drawn without a keypress"
+        );
+    }
+
+    #[test]
+    fn summary_figures_mirror_the_rendered_sections() {
+        let start = noon();
+        let app = summary_app(start);
+        let text = buffer_text(&render_frame(&app, start));
+
+        assert!(text.contains("Missed due: 2"), "missed-due count");
+        assert!(text.contains("Due today: 1"), "due-today count");
+        assert!(text.contains("Overdue: 1"), "overdue count");
+        assert!(text.contains("Done: 1/2"), "the viewed day's done fraction");
+        assert!(
+            text.contains("High open: 1"),
+            "only open high-Priority tasks count"
+        );
+    }
+
+    #[test]
+    fn summary_tracked_total_includes_a_live_running_segment() {
+        let start = noon();
+        let app = summary_app(start);
+        let later = start + chrono::Duration::seconds(1800);
+
+        // Stored totals alone are 1:10; the live segment lifts them to 1:40.
+        let stored = buffer_text(&render_frame(&app, start));
+        assert!(
+            stored.contains("Tracked: 1:10"),
+            "stored totals before the live segment"
+        );
+        let running = buffer_text(&render_frame(&app, later));
+        assert!(
+            running.contains("Tracked: 1:40"),
+            "the live segment joins the total"
+        );
+    }
+
+    #[test]
+    fn summary_title_names_the_active_tag_filter() {
+        let mut app = App::new(
+            day(),
+            vec![
+                tagged_task(1, "work today", &["work"]),
+                tagged_task(2, "admin today", &["admin"]),
+            ],
+            vec![],
+        );
+        app.set_all_tags(vec!["admin".to_string(), "work".to_string()]);
+        app.update(Message::CycleTagFilter); // -> "#admin"
+
+        let text = buffer_text(&render_frame(&app, noon()));
+        assert!(
+            text.contains("Summary — #admin"),
+            "the Summary names its scope"
+        );
+        assert!(
+            text.contains("Done: 0/1"),
+            "the figures narrow with the filter"
+        );
+    }
+
+    #[test]
+    fn footer_drops_the_done_fraction_and_keeps_the_hints() {
+        let text = buffer_text(&render_frame(&smoke_app(), noon()));
+        let footer = footer_text(&text);
+
+        assert!(!footer.contains("done"), "the done figure is gone");
+        assert!(!footer.contains("0/2"), "the fraction is gone");
+        assert!(footer.contains("j/k move"), "keybinding hints stay");
+        assert!(footer.contains("w timer"), "keybinding hints stay");
+    }
+
+    #[test]
+    fn status_line_keeps_the_missed_due_warning_colour() {
+        // smoke_app carries a missed-due section.
+        let buffer = render_frame(&smoke_app(), noon());
+        let status_row = buffer.area.height - 2;
+        let warning = (0..buffer.area.width).any(|x| buffer[(x, status_row)].fg == theme::ERROR);
+        assert!(warning, "the status line still warns in the error colour");
     }
 
     #[test]
