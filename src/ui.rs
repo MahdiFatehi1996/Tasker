@@ -194,10 +194,12 @@ fn task_row(task: &Task, selected: bool, flag: Option<String>, timer: String) ->
         theme::selection()
     } else if task.done {
         theme::done()
-    } else if task.priority == Priority::High {
-        theme::alert()
     } else {
-        theme::dim()
+        match task.priority {
+            Priority::High => theme::alert(),
+            Priority::Medium => theme::warning(),
+            Priority::Low => theme::dim(),
+        }
     };
     let mut spans = vec![
         Span::styled(marker, row_style),
@@ -263,7 +265,7 @@ fn overdue_flag(task: &Task) -> Option<String> {
 }
 
 /// Bordered section frame in the palette: dim border, themed title, and the
-/// amber backdrop so blank rows inside the box stay on-theme.
+/// dark backdrop so blank rows inside the box stay on-theme.
 fn section_block(title: &str, title_style: Style) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -303,11 +305,12 @@ impl Section {
         }
     }
 
-    /// Title style: Missed due keeps the alert colour, the rest are strong.
+    /// Title style: Missed due keeps the error colour, the rest take the
+    /// accent so the day-list headings read as one family.
     fn title_style(self) -> Style {
         match self {
             Section::MissedDue => theme::alert(),
-            _ => theme::strong(),
+            _ => theme::accent(),
         }
     }
 
@@ -373,7 +376,7 @@ fn day_sections(app: &App) -> Vec<(Section, Vec<Task>)> {
 /// when non-empty, viewed day, status footer).
 fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
     // Paint the whole frame in the palette first, so any cell no widget
-    // covers still sits on the amber-phosphor backdrop.
+    // covers still sits on the dark backdrop.
     frame.render_widget(Block::default().style(theme::text()), frame.area());
 
     let calendar = month_calendar(app, today);
@@ -1002,22 +1005,40 @@ mod tests {
         assert!(text.contains("Tasker — "), "day heading drawn");
         assert!(text.contains("old overdue work"), "overdue row drawn");
 
-        // The palette reaches the buffer: backdrop set, and every accent used.
-        assert_eq!(buffer[(0, 0)].bg, theme::BACKGROUND);
+        // The palette reaches the buffer: backdrop set, and every role used.
+        assert_eq!(buffer[(0, 0)].bg, theme::BACKGROUND, "backdrop painted");
         assert!(
             buffer
                 .content()
                 .iter()
-                .any(|cell| cell.fg == theme::PRIMARY),
-            "amber primary used"
+                .any(|cell| cell.fg == theme::FOREGROUND),
+            "foreground used"
         );
         assert!(
             buffer.content().iter().any(|cell| cell.fg == theme::DIM),
             "dim secondary used"
         );
         assert!(
-            buffer.content().iter().any(|cell| cell.fg == theme::ALERT),
-            "alert red used"
+            buffer.content().iter().any(|cell| cell.fg == theme::ACCENT),
+            "accent used"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme::SELECTION),
+            "selection fill used"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.fg == theme::WARNING),
+            "warning used"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme::ERROR),
+            "error used"
         );
     }
 
