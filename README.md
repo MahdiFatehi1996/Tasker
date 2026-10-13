@@ -112,7 +112,36 @@ set TASKER_DB=D:\my-tasks.db & tasker
 ### Prebuilt binaries
 
 Tagged releases publish prebuilt binaries for Windows, Linux, and macOS on the
-[Releases](https://github.com/MahdiFatehi1996/Tasker/releases) page.
+[Releases](https://github.com/MahdiFatehi1996/Tasker/releases) page. Each target ships both a raw
+executable and an archive (`.tar.gz`, or `.zip` on Windows), and every release carries a
+`SHA256SUMS.txt` covering all of them plus a build provenance attestation.
+
+### Package managers
+
+```sh
+# Windows (Scoop)
+scoop bucket add tasker https://github.com/MahdiFatehi1996/scoop-bucket
+scoop install tasker
+
+# macOS and Linux (Homebrew)
+brew tap MahdiFatehi1996/tap
+brew install tasker
+```
+
+Both install the matching prebuilt binary from the latest release and pin its checksum. On
+Windows, `winget install MahdiFatehi1996.Tasker` is
+[in review](https://github.com/microsoft/winget-pkgs/pull/451584) for the Windows Package Manager
+community index.
+
+Without a package manager:
+
+```sh
+cargo install --git https://github.com/MahdiFatehi1996/Tasker.git
+cargo binstall tasker-tui     # prebuilt binary, once the crate is published
+```
+
+Both of those need a Rust toolchain, and a C compiler because SQLite is bundled — which is exactly
+what the package managers above spare you.
 
 ### Platform notes
 
