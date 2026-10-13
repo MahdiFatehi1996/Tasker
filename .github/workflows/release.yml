@@ -1,16 +1,39 @@
 name: Verify & Release
 
+# The repository's only workflow. Three jobs, each gating the next:
+#
+#   verify   fmt + clippy + test on Linux and Windows
+#   build    release binary for every supported target, uploaded as artifacts
+#   release  checksums + build provenance + GitHub Release
+#
+# Triggers:
+#   push tag v*        verify -> build -> publish   (this is how a release ships)
+#   push to main       verify only
+#   workflow_dispatch  verify; build+release too when dispatched with dry_run,
+#                      or against a tag ref (gh workflow run release.yml --ref v0.2.0)
+
 on:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build every target and run every check, but skip publishing the release.
+        type: boolean
+        default: false
 
+# Read-only by default; the release job widens its own scope.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   verify:
@@ -21,22 +44,22 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
-  release:
+  build:
     name: ${{ matrix.target }}
     needs: verify
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.dry_run == true }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -51,8 +74,11 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -60,24 +86,59 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage binary
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/tasker${{ matrix.ext }}" \
              "dist/tasker-${{ matrix.target }}${{ matrix.ext }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tasker-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release ${{ github.ref_name }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # sign the build provenance
+      attestations: write # store the attestations
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum tasker-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          {
+            echo "### Checksums"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/tasker-*
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        if: ${{ inputs.dry_run != true }}
+        uses: softprops/action-gh-release@v3
         with:
           name: Tasker ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
           body: |
-            Tasker ${{ github.ref_name }} — the "Pro" release.
-
-            - Due date-times with **Due today** / **Missed due** sections and a launch toast
-            - Multiple **tags** per task with an `f` filter
-            - Live per-task **timer** (`w`), `H:MM` totals that survive restarts
-            - **CLI** companion: `add` / `done` / `list` / `export --format json|markdown`
-            - **Amber-phosphor** theme across the whole interface
-            - One local SQLite file; no accounts, no network, no server
+            Offline, keyboard-driven daily task manager for the terminal: single binary, local SQLite, no network.
+            Verify a download against `SHA256SUMS.txt`, or use `gh attestation verify <file> --repo MahdiFatehi1996/Tasker`.
+          generate_release_notes: true
           files: dist/*
+          fail_on_unmatched_files: true
