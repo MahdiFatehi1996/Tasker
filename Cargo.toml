@@ -1,7 +1,21 @@
 [package]
-name = "tasker"
+name = "tasker-tui"
 version = "0.3.2"
 edition = "2024"
+description = "Offline, keyboard-driven daily task manager for the terminal: one task list per day, automatic carry-over, tags, a live timer, and a scriptable CLI."
+license = "MIT"
+repository = "https://github.com/MahdiFatehi1996/Tasker"
+homepage = "https://github.com/MahdiFatehi1996/Tasker"
+readme = "README.md"
+keywords = ["task", "todo", "tui", "terminal", "cli"]
+categories = ["command-line-utilities"]
+exclude = [".github/"]
+
+# The crate is published as `tasker-tui` (the obvious names are taken on
+# crates.io) but the binary it installs is still `tasker`.
+[[bin]]
+name = "tasker"
+path = "src/main.rs"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -13,3 +27,15 @@ notify-rust = "4.18.2"
 ratatui = "0.30.2"
 rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
 time = "0.3.55"
+
+# Lets `cargo binstall tasker-tui` fetch the prebuilt binary from the GitHub
+# release instead of compiling. The assets carry the target, not the version,
+# and Windows ships a .zip rather than a .tar.gz.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tasker-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tasker-{ target }.zip"
+pkg-fmt = "zip"

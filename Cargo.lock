@@ -1909,7 +1909,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tasker"
+name = "tasker-tui"
 version = "0.3.2"
 dependencies = [
  "chrono",
