@@ -1,6 +1,6 @@
-//! Non-interactive command-line surface: `add` / `done` / `rm` / `list` /
-//! `export`, plus the Agent interface's reads (`show` / `tags` / `stats`) and
-//! `capabilities`.
+//! Non-interactive command-line surface: the writes (`add` / `done` /
+//! `update` / `reopen` / `rm`) and reads (`list` / `show` / `tags` / `stats` /
+//! `export`), plus `capabilities`.
 //!
 //! Shares the storage seam with the TUI — every command reads and writes
 //! through [`Database`], never SQLite directly, and resolves the database
@@ -19,7 +19,10 @@ use chrono::{Local, NaiveDate};
 
 use crate::db::{Database, SCHEMA_VERSION};
 use crate::json::{JsonObject, JsonWriter, envelope, string_array};
-use crate::model::{NewTask, Priority, Task, format_due_input, format_tracked};
+use crate::model::{
+    NewTask, Priority, Task, format_due_input, format_tracked, is_blank_title, parse_due_input,
+    parse_tags_input,
+};
 
 /// A command failure, classified so a caller can map it to an exit code.
 /// Exactly one class: usage, not-found, or storage.
@@ -99,25 +102,76 @@ pub enum ExportFormat {
     Markdown,
 }
 
+/// The fields an `update` may change. Each is optional: `None` leaves the
+/// field untouched. `due` is doubly optional so a provided blank can clear
+/// it (`Some(None)`) without colliding with "not provided" (`None`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateFields {
+    /// Replace the title (must be non-blank).
+    pub title: Option<String>,
+    /// Replace the priority.
+    pub priority: Option<Priority>,
+    /// Replace (`Some(Some(..))`) or clear (`Some(None)`) the due moment.
+    pub due: Option<Option<chrono::NaiveDateTime>>,
+    /// Replace the whole tag set (normalized; blank content clears it).
+    pub tags: Option<Vec<String>>,
+    /// Replace the note body.
+    pub notes: Option<String>,
+}
+
 /// A parsed command line (after `--db` extraction).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Launch the interactive TUI (no arguments beyond `--db`).
     Tui,
-    /// Add a task titled `title` to today.
+    /// Add a task, optionally carrying day, priority, due moment, tags, and
+    /// notes so a caller can capture a well-formed task in one call.
     Add {
         /// The task title (trimmed; must be non-blank).
         title: String,
+        /// Day to pin the task to; defaults to today.
+        day: Option<NaiveDate>,
+        /// Priority; defaults to medium.
+        priority: Priority,
+        /// Optional due moment; `None` means no deadline.
+        due: Option<chrono::NaiveDateTime>,
+        /// Attached tags (normalized).
+        tags: Vec<String>,
+        /// The note body.
+        notes: String,
+        /// Emit the bare JSON task object instead of human text.
+        json: bool,
     },
     /// Mark task `id` done.
     Done {
         /// The task id to complete.
         id: i64,
+        /// Emit the bare JSON task object instead of human text.
+        json: bool,
+    },
+    /// Change one or more of a task's fields, leaving every other field
+    /// untouched so a concurrent change is not clobbered.
+    Update {
+        /// The task id to change.
+        id: i64,
+        /// The fields actually provided on the command line.
+        fields: UpdateFields,
+        /// Emit the bare JSON task object instead of human text.
+        json: bool,
+    },
+    /// Clear a task's done state so it returns to its place in the day list.
+    Reopen {
+        /// The task id to reopen.
+        id: i64,
+        /// Emit the bare JSON task object instead of human text.
+        json: bool,
     },
     /// Delete task `id`.
     Remove {
         /// The task id to delete.
         id: i64,
+        /// Emit the removed task as a bare JSON object instead of human text.
+        json: bool,
     },
     /// Print today's view (sections + rows); `--json` wraps the four
     /// sections in the Agent interface envelope.
@@ -163,9 +217,19 @@ pub enum Command {
 /// Usage banner printed on argument errors.
 pub const USAGE: &str = "\
 tasker [--db <path>]                       launch the TUI
-tasker add \"title\"                        add a task to today
-tasker done <id>                           mark a task done
-tasker rm <id>                             delete a task
+tasker add \"title\" [--json]               add a task to today; also
+                [--day YYYY-MM-DD]         --priority, --due, --tags, --notes
+                [--priority low|medium|high]
+                [--due \"YYYY-MM-DD HH:MM\"]
+                [--tags \"a, b\"] [--notes \"...\"]
+tasker done <id> [--json]                  mark a task done
+tasker reopen <id> [--json]                clear a task's done state
+tasker update <id> [--json]                change only the given fields
+                [--title \"...\"]
+                [--priority low|medium|high]
+                [--due \"YYYY-MM-DD HH:MM\"]  (blank --due clears it)
+                [--tags \"a, b\"] [--notes \"...\"]
+tasker rm <id> [--json]                    delete a task
 tasker list [--json]                       print today's view
 tasker show <id> [--json]                  print one task
 tasker tags [--json]                       list the tags in use
@@ -173,7 +237,8 @@ tasker stats [--json]                      print the day's figures
 tasker export --format json|markdown       dump all tasks or log a day
                 [--day YYYY-MM-DD]         (markdown: day to log)
 tasker capabilities [--json]               report contract and schema versions
-exit codes: 0 success, 2 usage, 3 not found, 4 storage";
+exit codes: 0 success, 2 usage, 3 not found, 4 storage
+a title may begin with dashes after a `--` terminator";
 
 /// Parse the process argument list (including `argv[0]`) into an optional
 /// explicit database path and a command. Extracts `--db <path>` /
@@ -205,32 +270,20 @@ pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, Command), Command
 fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
     match positional.first().map(String::as_str) {
         None => Ok(Command::Tui),
-        Some("add") => {
-            let title = positional[1..].join(" ").trim().to_string();
-            if title.is_empty() {
-                Err(CommandError::usage("add needs a title"))
-            } else {
-                Ok(Command::Add { title })
-            }
+        Some("add") => parse_add(&positional[1..]),
+        Some("done") => {
+            let (id, json) = parse_id_and_json("done", &positional[1..])?;
+            Ok(Command::Done { id, json })
         }
-        Some("done") => match positional.get(1) {
-            None => Err(CommandError::usage("done needs a task id")),
-            Some(raw) => raw
-                .parse::<i64>()
-                .map(|id| Command::Done { id })
-                .map_err(|_| {
-                    CommandError::usage(format!("done needs a numeric task id, got: {raw}"))
-                }),
-        },
-        Some("rm") => match positional.get(1) {
-            None => Err(CommandError::usage("rm needs a task id")),
-            Some(raw) => raw
-                .parse::<i64>()
-                .map(|id| Command::Remove { id })
-                .map_err(|_| {
-                    CommandError::usage(format!("rm needs a numeric task id, got: {raw}"))
-                }),
-        },
+        Some("update") => parse_update(&positional[1..]),
+        Some("reopen") => {
+            let (id, json) = parse_id_and_json("reopen", &positional[1..])?;
+            Ok(Command::Reopen { id, json })
+        }
+        Some("rm") => {
+            let (id, json) = parse_id_and_json("rm", &positional[1..])?;
+            Ok(Command::Remove { id, json })
+        }
         Some("list") => {
             parse_json_flag("list", &positional[1..]).map(|json| Command::List { json })
         }
@@ -245,6 +298,214 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
         Some("capabilities") => parse_capabilities(&positional[1..]),
         Some(other) => Err(CommandError::usage(format!("unknown command: {other}"))),
     }
+}
+
+/// Parse `add`: a title plus optional `--day`, `--priority`, `--due`,
+/// `--tags`, `--notes`, and `--json`. Recognised flags (and their values) are
+/// pulled out of the argument vector *before* the remainder is joined into
+/// the title, so `add "buy milk" --priority high` never titles the task
+/// `buy milk --priority high`. A `--` terminator sends everything after it
+/// into the title verbatim, so a title may begin with dashes.
+fn parse_add(rest: &[String]) -> Result<Command, CommandError> {
+    let mut day = None;
+    let mut priority = Priority::default();
+    let mut due = None;
+    let mut tags = Vec::new();
+    let mut notes = String::new();
+    let mut json = false;
+    let mut title_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "--" {
+            title_parts.extend(rest[i + 1..].iter().cloned());
+            break;
+        } else if arg == "--json" {
+            json = true;
+            i += 1;
+        } else if let Some(value) = arg.strip_prefix("--day=") {
+            day = Some(parse_day(value)?);
+            i += 1;
+        } else if arg == "--day" {
+            day = Some(parse_day(next_value(rest, i, "--day needs YYYY-MM-DD")?)?);
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--priority=") {
+            priority = parse_priority(value)?;
+            i += 1;
+        } else if arg == "--priority" {
+            priority = parse_priority(next_value(rest, i, "--priority needs low|medium|high")?)?;
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--due=") {
+            due = parse_due(value)?;
+            i += 1;
+        } else if arg == "--due" {
+            due = parse_due(next_value(rest, i, "--due needs a date-time")?)?;
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--tags=") {
+            tags = parse_tags_input(value);
+            i += 1;
+        } else if arg == "--tags" {
+            tags = parse_tags_input(next_value(rest, i, "--tags needs a list")?);
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--notes=") {
+            notes = value.to_string();
+            i += 1;
+        } else if arg == "--notes" {
+            notes = next_value(rest, i, "--notes needs text")?.clone();
+            i += 2;
+        } else {
+            title_parts.push(arg.clone());
+            i += 1;
+        }
+    }
+    let title = title_parts.join(" ").trim().to_string();
+    if title.is_empty() {
+        return Err(CommandError::usage("add needs a title"));
+    }
+    Ok(Command::Add {
+        title,
+        day,
+        priority,
+        due,
+        tags,
+        notes,
+        json,
+    })
+}
+
+/// Parse `update <id>`: exactly one numeric id plus at least one of
+/// `--title`, `--priority`, `--due`, `--tags`, `--notes`, and an optional
+/// `--json`. Every field is independent — an omitted one is left untouched.
+fn parse_update(rest: &[String]) -> Result<Command, CommandError> {
+    let mut id = None;
+    let mut title = None;
+    let mut priority = None;
+    let mut due = None;
+    let mut tags = None;
+    let mut notes = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "--json" {
+            json = true;
+            i += 1;
+        } else if let Ok(parsed) = arg.parse::<i64>() {
+            if id.is_some() {
+                return Err(CommandError::usage("update takes one task id"));
+            }
+            id = Some(parsed);
+            i += 1;
+        } else if let Some(value) = arg.strip_prefix("--title=") {
+            title = Some(value.to_string());
+            i += 1;
+        } else if arg == "--title" {
+            title = Some(next_value(rest, i, "--title needs text")?.clone());
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--priority=") {
+            priority = Some(parse_priority(value)?);
+            i += 1;
+        } else if arg == "--priority" {
+            priority = Some(parse_priority(next_value(
+                rest,
+                i,
+                "--priority needs low|medium|high",
+            )?)?);
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--due=") {
+            due = Some(parse_due(value)?);
+            i += 1;
+        } else if arg == "--due" {
+            due = Some(parse_due(next_value(rest, i, "--due needs a date-time")?)?);
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--tags=") {
+            tags = Some(parse_tags_input(value));
+            i += 1;
+        } else if arg == "--tags" {
+            tags = Some(parse_tags_input(next_value(
+                rest,
+                i,
+                "--tags needs a list",
+            )?));
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--notes=") {
+            notes = Some(value.to_string());
+            i += 1;
+        } else if arg == "--notes" {
+            notes = Some(next_value(rest, i, "--notes needs text")?.clone());
+            i += 2;
+        } else {
+            return Err(CommandError::usage(format!("unknown update option: {arg}")));
+        }
+    }
+    let id = id.ok_or_else(|| CommandError::usage("update needs a task id"))?;
+    if title.is_none() && priority.is_none() && due.is_none() && tags.is_none() && notes.is_none() {
+        return Err(CommandError::usage(
+            "update needs a field to change (--title, --priority, --due, --tags, --notes)",
+        ));
+    }
+    if let Some(title) = &title
+        && is_blank_title(title)
+    {
+        return Err(CommandError::usage("update --title must not be blank"));
+    }
+    Ok(Command::Update {
+        id,
+        fields: UpdateFields {
+            title,
+            priority,
+            due,
+            tags,
+            notes,
+        },
+        json,
+    })
+}
+
+/// Parse `<id> [--json]` for the single-id write commands (`done`, `reopen`,
+/// `rm`). Exactly one numeric id, no stray arguments — the same convention
+/// `show` and `list` use.
+fn parse_id_and_json(command: &str, rest: &[String]) -> Result<(i64, bool), CommandError> {
+    let mut id = None;
+    let mut json = false;
+    for arg in rest {
+        if arg == "--json" {
+            json = true;
+        } else if let Ok(parsed) = arg.parse::<i64>() {
+            if id.is_some() {
+                return Err(CommandError::usage(format!("{command} takes one task id")));
+            }
+            id = Some(parsed);
+        } else {
+            return Err(CommandError::usage(format!(
+                "{command} needs a numeric task id, got: {arg}"
+            )));
+        }
+    }
+    match id {
+        Some(id) => Ok((id, json)),
+        None => Err(CommandError::usage(format!("{command} needs a task id"))),
+    }
+}
+
+/// The value following a space-separated flag, or a usage error naming it.
+fn next_value<'a>(rest: &'a [String], i: usize, message: &str) -> Result<&'a String, CommandError> {
+    rest.get(i + 1)
+        .ok_or_else(|| CommandError::usage(message.to_string()))
+}
+
+/// Parse a `--priority` value; an unrecognised name is a usage error, never
+/// a silent default.
+fn parse_priority(value: &str) -> Result<Priority, CommandError> {
+    Priority::parse(value)
+        .ok_or_else(|| CommandError::usage(format!("invalid priority: {value} (low|medium|high)")))
+}
+
+/// Parse a `--due` value with the shared editor parser. Blank clears it;
+/// garbage is a usage error, never a silent default.
+fn parse_due(value: &str) -> Result<Option<chrono::NaiveDateTime>, CommandError> {
+    parse_due_input(value)
+        .ok_or_else(|| CommandError::usage(format!("invalid due: {value} (YYYY-MM-DD HH:MM)")))
 }
 
 /// Parse a read command's only option: absent means human text, `--json`
@@ -354,9 +615,27 @@ fn parse_day(value: &str) -> Result<NaiveDate, CommandError> {
 pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> {
     match command {
         Command::Tui => Ok(String::new()),
-        Command::Add { title } => add(db, &title),
-        Command::Done { id } => done(db, id),
-        Command::Remove { id } => remove(db, id),
+        Command::Add {
+            title,
+            day,
+            priority,
+            due,
+            tags,
+            notes,
+            json,
+        } => {
+            let day = day.unwrap_or_else(|| Local::now().date_naive());
+            let mut new_task = NewTask::dated(day, title);
+            new_task.priority = priority;
+            new_task.due = due;
+            new_task.tags = tags;
+            new_task.notes = notes;
+            add(db, &new_task, json)
+        }
+        Command::Done { id, json } => done(db, id, json),
+        Command::Update { id, fields, json } => update(db, id, fields, json),
+        Command::Reopen { id, json } => reopen(db, id, json),
+        Command::Remove { id, json } => remove(db, id, json),
         Command::List { json } => list(db, json),
         Command::Show { id, json } => show(db, id, json),
         Command::Tags { json } => tags(db, json),
@@ -366,32 +645,108 @@ pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> 
     }
 }
 
-fn add(db: &Database, title: &str) -> Result<String, CommandError> {
-    let today = Local::now().date_naive();
-    let id = db
-        .save_task(&NewTask::dated(today, title.to_string()))
-        .map_err(storage)?;
-    Ok(format!("Added task {id}: {title}"))
+/// Render one task as the bare JSON object the contract promises for a single
+/// task (never an envelope), shared by every write command's `--json` form.
+fn task_json(task: &Task) -> String {
+    let mut writer = JsonWriter::new();
+    writer.task(task, 0);
+    writer.finish()
 }
 
-fn done(db: &Database, id: i64) -> Result<String, CommandError> {
+/// Add a task; `--json` emits the stored task as a bare object.
+fn add(db: &Database, new_task: &NewTask, json: bool) -> Result<String, CommandError> {
+    let id = db.save_task(new_task).map_err(storage)?;
+    let task = db
+        .task_by_id(id)
+        .map_err(storage)?
+        .ok_or_else(|| CommandError::storage("task missing after save"))?;
+    if json {
+        Ok(task_json(&task))
+    } else {
+        Ok(format!("Added task {id}: {}", task.title))
+    }
+}
+
+/// Mark task `id` done; `--json` emits the resulting task as a bare object.
+fn done(db: &Database, id: i64, json: bool) -> Result<String, CommandError> {
     let mut task = db
         .task_by_id(id)
         .map_err(storage)?
         .ok_or_else(|| CommandError::not_found(format!("no task with id {id}")))?;
     task.done = true;
     db.update_task(&task).map_err(storage)?;
-    Ok(format!("Done task {id}: {}", task.title))
+    if json {
+        Ok(task_json(&task))
+    } else {
+        Ok(format!("Done task {id}: {}", task.title))
+    }
 }
 
-/// Delete task `id`; an unknown id is a not-found error.
-fn remove(db: &Database, id: i64) -> Result<String, CommandError> {
+/// Change only the fields `fields` provides, leaving every other field as it
+/// was, then persist. An unknown id is a not-found error. `--json` emits the
+/// resulting task as a bare object.
+fn update(
+    db: &Database,
+    id: i64,
+    fields: UpdateFields,
+    json: bool,
+) -> Result<String, CommandError> {
+    let mut task = db
+        .task_by_id(id)
+        .map_err(storage)?
+        .ok_or_else(|| CommandError::not_found(format!("no task with id {id}")))?;
+    if let Some(title) = fields.title {
+        task.title = title;
+    }
+    if let Some(priority) = fields.priority {
+        task.priority = priority;
+    }
+    if let Some(due) = fields.due {
+        task.due = due;
+    }
+    if let Some(tags) = fields.tags {
+        task.tags = tags;
+    }
+    if let Some(notes) = fields.notes {
+        task.notes = notes;
+    }
+    db.update_task(&task).map_err(storage)?;
+    if json {
+        Ok(task_json(&task))
+    } else {
+        Ok(format!("Updated task {id}: {}", task.title))
+    }
+}
+
+/// Clear a task's done state so it returns to its day list. An unknown id is
+/// a not-found error. `--json` emits the resulting task as a bare object.
+fn reopen(db: &Database, id: i64, json: bool) -> Result<String, CommandError> {
+    let mut task = db
+        .task_by_id(id)
+        .map_err(storage)?
+        .ok_or_else(|| CommandError::not_found(format!("no task with id {id}")))?;
+    task.done = false;
+    db.update_task(&task).map_err(storage)?;
+    if json {
+        Ok(task_json(&task))
+    } else {
+        Ok(format!("Reopened task {id}: {}", task.title))
+    }
+}
+
+/// Delete task `id`; an unknown id is a not-found error. `--json` emits the
+/// removed task as a bare object (its state as it was just before deletion).
+fn remove(db: &Database, id: i64, json: bool) -> Result<String, CommandError> {
     let task = db
         .task_by_id(id)
         .map_err(storage)?
         .ok_or_else(|| CommandError::not_found(format!("no task with id {id}")))?;
     db.delete_task(id).map_err(storage)?;
-    Ok(format!("Removed task {id}: {}", task.title))
+    if json {
+        Ok(task_json(&task))
+    } else {
+        Ok(format!("Removed task {id}: {}", task.title))
+    }
 }
 
 /// Today's view: plain text by default (missed-due, due-today, overdue, then
@@ -584,10 +939,12 @@ const COMMANDS: &[&str] = &[
     "done",
     "export",
     "list",
+    "reopen",
     "rm",
     "show",
     "stats",
     "tags",
+    "update",
 ];
 
 /// Report the Agent interface contract version and the storage schema version.
@@ -673,6 +1030,20 @@ mod tests {
 
     fn day() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, 10).expect("valid date")
+    }
+
+    /// The `add` command with everything defaulted: no day, medium priority,
+    /// no due, no tags, no notes, human output.
+    fn add_command(title: &str) -> Command {
+        Command::Add {
+            title: title.to_string(),
+            day: None,
+            priority: Priority::Medium,
+            due: None,
+            tags: Vec::new(),
+            notes: String::new(),
+            json: false,
+        }
     }
 
     /// Assert `text` is well-formed JSON. A deliberately small recursive
@@ -863,22 +1234,135 @@ mod tests {
     fn add_collects_and_trims_the_title() {
         assert_eq!(
             parse_args(&args(&["add", "buy", "milk"])),
-            Ok((
-                None,
-                Command::Add {
-                    title: "buy milk".to_string()
-                }
-            ))
+            Ok((None, add_command("buy milk")))
         );
         assert!(parse_args(&args(&["add"])).is_err());
         assert!(parse_args(&args(&["add", "   "])).is_err());
     }
 
     #[test]
+    fn add_pulls_flags_out_before_joining_the_title() {
+        let parsed = parse_args(&args(&["add", "buy milk", "--priority", "high"]));
+        assert_eq!(
+            parsed,
+            Ok((
+                None,
+                Command::Add {
+                    title: "buy milk".to_string(),
+                    day: None,
+                    priority: Priority::High,
+                    due: None,
+                    tags: Vec::new(),
+                    notes: String::new(),
+                    json: false,
+                }
+            )),
+            "the flag must not leak into the title"
+        );
+
+        let parsed = parse_args(&args(&[
+            "add",
+            "--day=2026-10-01",
+            "--priority=low",
+            "--due",
+            "2026-10-02 08:15",
+            "--tags",
+            "Work, admin",
+            "--notes=call first",
+            "order",
+            "supplies",
+        ]));
+        assert_eq!(
+            parsed,
+            Ok((
+                None,
+                Command::Add {
+                    title: "order supplies".to_string(),
+                    day: Some(NaiveDate::from_ymd_opt(2026, 10, 1).expect("valid date")),
+                    priority: Priority::Low,
+                    due: Some(
+                        NaiveDate::from_ymd_opt(2026, 10, 2)
+                            .expect("valid date")
+                            .and_hms_opt(8, 15, 0)
+                            .expect("valid time")
+                    ),
+                    tags: vec!["admin".to_string(), "work".to_string()],
+                    notes: "call first".to_string(),
+                    json: false,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn add_accepts_a_double_dash_terminator_for_a_dashed_title() {
+        assert_eq!(
+            parse_args(&args(&["add", "--", "--not-a-flag", "title"])),
+            Ok((None, add_command("--not-a-flag title")))
+        );
+        assert_eq!(
+            parse_args(&args(&["add", "--priority", "low", "--", "--dashed"])),
+            Ok((
+                None,
+                Command::Add {
+                    title: "--dashed".to_string(),
+                    day: None,
+                    priority: Priority::Low,
+                    due: None,
+                    tags: Vec::new(),
+                    notes: String::new(),
+                    json: false,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn add_rejects_bad_day_priority_and_due_as_usage() {
+        for argv in [
+            vec!["add", "x", "--priority", "urgent"],
+            vec!["add", "x", "--priority"],
+            vec!["add", "x", "--due", "soon"],
+            vec!["add", "x", "--due"],
+            vec!["add", "x", "--day", "2026-13-01"],
+            vec!["add", "x", "--tags"],
+            vec!["add", "x", "--notes"],
+        ] {
+            let error = parse_args(&args(&argv)).expect_err(&format!("{argv:?} should fail"));
+            assert!(matches!(error, CommandError::Usage(_)), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn add_json_flag_is_extracted() {
+        assert_eq!(
+            parse_args(&args(&["add", "x", "--json"])),
+            Ok((
+                None,
+                Command::Add {
+                    title: "x".to_string(),
+                    day: None,
+                    priority: Priority::Medium,
+                    due: None,
+                    tags: Vec::new(),
+                    notes: String::new(),
+                    json: true,
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn done_requires_a_numeric_id() {
         assert_eq!(
             parse_args(&args(&["done", "42"])),
-            Ok((None, Command::Done { id: 42 }))
+            Ok((
+                None,
+                Command::Done {
+                    id: 42,
+                    json: false
+                }
+            ))
         );
         assert!(parse_args(&args(&["done"])).is_err());
         assert!(parse_args(&args(&["done", "abc"])).is_err());
@@ -888,10 +1372,160 @@ mod tests {
     fn rm_requires_a_numeric_id() {
         assert_eq!(
             parse_args(&args(&["rm", "42"])),
-            Ok((None, Command::Remove { id: 42 }))
+            Ok((
+                None,
+                Command::Remove {
+                    id: 42,
+                    json: false
+                }
+            ))
         );
         assert!(parse_args(&args(&["rm"])).is_err());
         assert!(parse_args(&args(&["rm", "abc"])).is_err());
+    }
+
+    #[test]
+    fn single_id_write_commands_accept_json_and_reject_extras() {
+        for (command, json) in [
+            ("done", Command::Done { id: 7, json: true }),
+            ("reopen", Command::Reopen { id: 7, json: true }),
+            ("rm", Command::Remove { id: 7, json: true }),
+        ] {
+            assert_eq!(
+                parse_args(&args(&[command, "7", "--json"])),
+                Ok((None, json)),
+                "{command} --json"
+            );
+            assert!(
+                parse_args(&args(&[command, "7", "8"])).is_err(),
+                "{command} rejects a second id"
+            );
+            assert!(
+                parse_args(&args(&[command, "7", "--nope"])).is_err(),
+                "{command} rejects an unknown option"
+            );
+        }
+    }
+
+    #[test]
+    fn update_parses_each_field_independently() {
+        assert_eq!(
+            parse_args(&args(&["update", "42", "--title", "Renamed"])),
+            Ok((
+                None,
+                Command::Update {
+                    id: 42,
+                    fields: UpdateFields {
+                        title: Some("Renamed".to_string()),
+                        priority: None,
+                        due: None,
+                        tags: None,
+                        notes: None,
+                    },
+                    json: false,
+                }
+            ))
+        );
+        assert_eq!(
+            parse_args(&args(&["update", "42", "--priority", "low", "--json"])),
+            Ok((
+                None,
+                Command::Update {
+                    id: 42,
+                    fields: UpdateFields {
+                        title: None,
+                        priority: Some(Priority::Low),
+                        due: None,
+                        tags: None,
+                        notes: None,
+                    },
+                    json: true,
+                }
+            ))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "update",
+                "42",
+                "--tags",
+                "Work, admin",
+                "--notes",
+                "hi"
+            ])),
+            Ok((
+                None,
+                Command::Update {
+                    id: 42,
+                    fields: UpdateFields {
+                        title: None,
+                        priority: None,
+                        due: None,
+                        tags: Some(vec!["admin".to_string(), "work".to_string()]),
+                        notes: Some("hi".to_string()),
+                    },
+                    json: false,
+                }
+            ))
+        );
+        assert_eq!(
+            parse_args(&args(&["update", "42", "--due", ""])),
+            Ok((
+                None,
+                Command::Update {
+                    id: 42,
+                    fields: UpdateFields {
+                        title: None,
+                        priority: None,
+                        due: Some(None),
+                        tags: None,
+                        notes: None,
+                    },
+                    json: false,
+                }
+            )),
+            "a blank --due clears the deadline"
+        );
+    }
+
+    #[test]
+    fn update_rejects_missing_id_missing_field_and_bad_values() {
+        assert!(parse_args(&args(&["update"])).is_err(), "no id");
+        assert!(
+            parse_args(&args(&["update", "42"])).is_err(),
+            "no field to change"
+        );
+        assert!(
+            parse_args(&args(&["update", "42", "--priority", "urgent"])).is_err(),
+            "bad priority"
+        );
+        assert!(
+            parse_args(&args(&["update", "42", "--due", "soon"])).is_err(),
+            "bad due"
+        );
+        assert!(
+            parse_args(&args(&["update", "42", "--title", "   "])).is_err(),
+            "blank title"
+        );
+        assert!(
+            parse_args(&args(&["update", "42", "43", "--notes", "x"])).is_err(),
+            "second id"
+        );
+    }
+
+    #[test]
+    fn reopen_requires_a_numeric_id() {
+        assert_eq!(
+            parse_args(&args(&["reopen", "42"])),
+            Ok((
+                None,
+                Command::Reopen {
+                    id: 42,
+                    json: false
+                }
+            ))
+        );
+        assert!(parse_args(&args(&["reopen"])).is_err());
+        assert!(parse_args(&args(&["reopen", "abc"])).is_err());
     }
 
     #[test]
@@ -1072,13 +1706,7 @@ mod tests {
     #[test]
     fn add_then_json_export_carries_every_field() {
         let db = Database::open_in_memory().expect("open in-memory database");
-        let output = execute(
-            &db,
-            Command::Add {
-                title: "Buy milk".to_string(),
-            },
-        )
-        .expect("add");
+        let output = execute(&db, add_command("Buy milk")).expect("add");
         assert!(output.contains("Buy milk"));
 
         let json = execute(
@@ -1176,10 +1804,19 @@ mod tests {
     fn done_marks_the_task_and_unknown_id_errors() {
         let db = seeded_db();
         let id = db.all_tasks().expect("list")[0].id;
-        let output = execute(&db, Command::Done { id }).expect("done");
+        let output = execute(&db, Command::Done { id, json: false }).expect("done");
         assert!(output.contains(&id.to_string()));
         assert!(db.task_by_id(id).expect("load").expect("exists").done);
-        assert!(execute(&db, Command::Done { id: 9999 }).is_err());
+        assert!(
+            execute(
+                &db,
+                Command::Done {
+                    id: 9999,
+                    json: false
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1187,7 +1824,7 @@ mod tests {
         let db = seeded_db();
         let id = db.all_tasks().expect("list")[0].id;
 
-        let output = execute(&db, Command::Remove { id }).expect("rm");
+        let output = execute(&db, Command::Remove { id, json: false }).expect("rm");
 
         assert!(output.contains(&id.to_string()), "{output}");
         assert!(output.contains("Quarterly report"), "{output}");
@@ -1197,13 +1834,207 @@ mod tests {
     #[test]
     fn rm_unknown_id_is_a_not_found_error() {
         let db = seeded_db();
-        let error = execute(&db, Command::Remove { id: 9999 }).expect_err("unknown id");
+        let error = execute(
+            &db,
+            Command::Remove {
+                id: 9999,
+                json: false,
+            },
+        )
+        .expect_err("unknown id");
         assert!(matches!(&error, CommandError::NotFound(_)), "{error:?}");
         assert_eq!(
             exit_code(&Err(error)),
             3,
             "not found exits 3 under the Agent interface contract"
         );
+    }
+
+    #[test]
+    fn add_json_emits_the_bare_task_with_every_captured_field() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let json = execute(
+            &db,
+            Command::Add {
+                title: "Ship the report".to_string(),
+                day: Some(day()),
+                priority: Priority::High,
+                due: Some(day().and_hms_opt(17, 0, 0).expect("valid datetime")),
+                tags: vec!["work".to_string()],
+                notes: "line one\nline two".to_string(),
+                json: true,
+            },
+        )
+        .expect("add json");
+        assert_json_valid(&json);
+        assert!(json.starts_with('{'), "a single task is an object: {json}");
+        assert!(!json.contains("\"contract\""), "not enveloped: {json}");
+        for field in [
+            "id",
+            "day",
+            "title",
+            "done",
+            "priority",
+            "notes",
+            "due",
+            "tracked_secs",
+            "tags",
+        ] {
+            assert!(json.contains(&format!("\"{field}\"")), "no {field}: {json}");
+        }
+        assert!(json.contains("\"day\": \"2026-10-10\""), "{json}");
+        assert!(json.contains("\"priority\": \"high\""), "{json}");
+        assert!(json.contains("\"due\": \"2026-10-10T17:00:00\""), "{json}");
+        assert!(json.contains("\"tags\": [\"work\"]"), "{json}");
+        assert!(
+            json.contains("\"notes\": \"line one\\nline two\""),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn done_json_emits_the_resulting_task() {
+        let db = seeded_db();
+        let id = db.all_tasks().expect("list")[0].id;
+        let json = execute(&db, Command::Done { id, json: true }).expect("done json");
+        assert_json_valid(&json);
+        assert!(json.starts_with('{'), "bare task object: {json}");
+        assert!(json.contains("\"done\": true"), "{json}");
+    }
+
+    #[test]
+    fn update_changes_only_the_named_field() {
+        let db = seeded_db();
+        let id = db.all_tasks().expect("list")[0].id;
+        let before = db.task_by_id(id).expect("load").expect("exists");
+
+        let json = execute(
+            &db,
+            Command::Update {
+                id,
+                fields: UpdateFields {
+                    title: Some("Renamed".to_string()),
+                    ..UpdateFields::default()
+                },
+                json: true,
+            },
+        )
+        .expect("update title");
+        assert_json_valid(&json);
+        assert!(json.contains("\"title\": \"Renamed\""), "{json}");
+
+        let after = db.task_by_id(id).expect("load").expect("exists");
+        assert_eq!(after.title, "Renamed");
+        assert_eq!(after.priority, before.priority, "priority untouched");
+        assert_eq!(after.due, before.due, "due untouched");
+        assert_eq!(after.tags, before.tags, "tags untouched");
+        assert_eq!(after.notes, before.notes, "notes untouched");
+        assert_eq!(after.day, before.day, "day untouched");
+        assert_eq!(after.tracked_secs, before.tracked_secs);
+    }
+
+    #[test]
+    fn update_blank_due_clears_it() {
+        let db = seeded_db();
+        let id = db.all_tasks().expect("list")[0].id;
+        assert!(
+            db.task_by_id(id)
+                .expect("load")
+                .expect("exists")
+                .due
+                .is_some(),
+            "precondition: seeded task has a due moment"
+        );
+        execute(
+            &db,
+            Command::Update {
+                id,
+                fields: UpdateFields {
+                    due: Some(None),
+                    ..UpdateFields::default()
+                },
+                json: false,
+            },
+        )
+        .expect("clear due");
+        assert!(
+            db.task_by_id(id)
+                .expect("load")
+                .expect("exists")
+                .due
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn update_unknown_id_is_not_found_and_exits_three() {
+        let db = seeded_db();
+        let error = execute(
+            &db,
+            Command::Update {
+                id: 9999,
+                fields: UpdateFields {
+                    notes: Some("x".to_string()),
+                    ..UpdateFields::default()
+                },
+                json: true,
+            },
+        )
+        .expect_err("unknown id");
+        assert!(matches!(&error, CommandError::NotFound(_)), "{error:?}");
+        assert_eq!(exit_code(&Err(error)), 3);
+    }
+
+    #[test]
+    fn reopen_clears_done_and_returns_the_task_to_its_day() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let today = Local::now().date_naive();
+        let id = db
+            .save_task(&NewTask::dated(today, "Reopen me".to_string()))
+            .expect("save");
+        execute(&db, Command::Done { id, json: false }).expect("done");
+        assert!(db.task_by_id(id).expect("load").expect("exists").done);
+
+        let json = execute(&db, Command::Reopen { id, json: true }).expect("reopen");
+        assert_json_valid(&json);
+        assert!(json.contains("\"done\": false"), "{json}");
+
+        let task = db.task_by_id(id).expect("load").expect("exists");
+        assert!(!task.done);
+        assert_eq!(task.day, today);
+        assert!(
+            db.tasks_for_day(today)
+                .expect("day list")
+                .iter()
+                .any(|row| row.id == id),
+            "the reopened task is back in its day list"
+        );
+    }
+
+    #[test]
+    fn reopen_unknown_id_is_not_found_and_exits_three() {
+        let db = seeded_db();
+        let error = execute(
+            &db,
+            Command::Reopen {
+                id: 9999,
+                json: false,
+            },
+        )
+        .expect_err("unknown id");
+        assert!(matches!(&error, CommandError::NotFound(_)), "{error:?}");
+        assert_eq!(exit_code(&Err(error)), 3);
+    }
+
+    #[test]
+    fn rm_json_reports_the_removed_task_as_a_bare_object() {
+        let db = seeded_db();
+        let id = db.all_tasks().expect("list")[0].id;
+        let json = execute(&db, Command::Remove { id, json: true }).expect("rm json");
+        assert_json_valid(&json);
+        assert!(json.starts_with('{'), "bare task object: {json}");
+        assert!(json.contains("\"title\": \"Quarterly report\""), "{json}");
+        assert!(db.task_by_id(id).expect("load").is_none());
     }
 
     #[test]
@@ -1453,7 +2284,14 @@ mod tests {
     #[test]
     fn missing_task_carries_the_not_found_class() {
         let db = seeded_db();
-        let error = execute(&db, Command::Done { id: 9999 }).expect_err("no such task");
+        let error = execute(
+            &db,
+            Command::Done {
+                id: 9999,
+                json: false,
+            },
+        )
+        .expect_err("no such task");
         assert!(matches!(error, CommandError::NotFound(_)), "{error:?}");
     }
 
