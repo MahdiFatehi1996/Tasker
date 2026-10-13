@@ -23,10 +23,11 @@ day. Deadlines get their own **Due today** and **Missed due** sections, with a d
 launch for anything already late. Tasks carry **tags** you can filter by, and each task has a
 live **timer** that banks billable minutes across restarts.
 
-A month-grid **Calendar** jumps between days, and a built-in detail editor manages titles,
-priorities, due moments, tags, and notes — no accounts, no network, no server. Everything lives
-in one local SQLite file, and the same storage backs a non-interactive CLI for fast capture and
-export. Written in Rust, with `unsafe` code forbidden at the crate level.
+A month-grid **Calendar** jumps between days, a **Summary** reads out the shape of the day, and a
+built-in detail editor manages titles, priorities, due moments, tags, and notes — no accounts, no
+network, no server. Everything lives in one local SQLite file, and the same storage backs a
+non-interactive CLI for fast capture, search, and export. Written in Rust, with `unsafe` code
+forbidden at the crate level.
 
 ## 🖼️ Preview
 
@@ -34,20 +35,24 @@ export. Written in Rust, with `unsafe` code forbidden at the crate level.
 ┌─ Calendar ───────────┐ ┌─ Missed Due ───────────────────────────────────────────────────────┐
 │                      │ │  [ ] [due 2026-10-09 17:00 #work] Ship the report             0:45 │
 │     October 2026     │ └────────────────────────────────────────────────────────────────────┘
-│ Mo Tu We Th Fr Sa Su │ ┌─ Due Today ────────────────────────────────────────────────────────┐
+│ Mo Tu We Fr Sa Su    │ ┌─ Due Today ────────────────────────────────────────────────────────┐
 │           1  2  3  4 │ │> [ ] [due 2026-10-13 09:00] Stand-up notes                    0:12 │
 │  5  6  7  8  9 10 11 │ └────────────────────────────────────────────────────────────────────┘
 │ 12 13 14 15 16 17 18 │ ┌─ Overdue ──────────────────────────────────────────────────────────┐
 │ 19 20 21 22 23 24 25 │ │  [ ] [2026-10-11 #errands] Renew the domain                   0:00 │
 │  26 27 28 29 30 31   │ └────────────────────────────────────────────────────────────────────┘
-│                      │ ┌─ Tasker — Tue Oct 13, 2026 ────────────────────────────────────────┐
-└──────────────────────┘ │> [ ] [H] Draft the Q4 roadmap                               ▶ 1:20 │
-                         │  [x] [M] Reply to Amir #work                                  0:05 │
-                         │  [ ] [L] Water the plants #home                               0:00 │
-                         └────────────────────────────────────────────────────────────────────┘
+└──────────────────────┘ ┌─ Tasker — Tue Oct 13, 2026 ────────────────────────────────────────┐
+┌─ Summary ────────────┐ │> [ ] [H] Draft the Q4 roadmap                               ▶ 1:20 │
+│ Missed due         1 │ │  [x] [M] Reply to Amir #work                                  0:05 │
+│ Due today          1 │ │  [ ] [L] Water the plants #home                               0:00 │
+│ Overdue            1 │ └────────────────────────────────────────────────────────────────────┘
+│ Done             1/5 │
+│ Tracked          0:45│
+│ High open          1 │
+└──────────────────────┘
 
-                           2/5 done
-                           j/k move · x toggle · a add · e edit · w timer · f filter · [ ] day · t today · Tab cal · ? help · q quit
+                            ⚠ Missed due
+                            j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · / search · [ ] day · t today · Tab cal · ? help · q quit
 ```
 
 ## ✨ Features
@@ -57,10 +62,12 @@ export. Written in Rust, with `unsafe` code forbidden at the crate level.
 - **Due moments** — set an exact due date-time; **Due today** and **Missed due** sections surface hard commitments, and a launch toast flags anything already past due.
 - **Tags & filter** — attach multiple tags per task and cycle a one-tag filter to focus the whole list.
 - **Cross-day Search** — press `/` to find tasks by title or notes across every day; results group by day, the Summary mirrors them, and each result can be toggled, edited, deleted, or timed like a Day-list row.
+- **Day Summary** — a read-out beneath the Calendar: Missed-due / Due-today / Overdue counts, the day's Done fraction, total tracked time (including a running timer's live segment), and open high-priority tasks. It describes exactly what is rendered beside it, narrows with the tag filter, and names that filter in its title.
+- **Delete & undo** — `d` removes the selected task and `u` restores the most recently deleted one for the session; `tasker rm <id>` does the same from the CLI. Deleting a task whose tags no other task uses prunes those tags.
 - **Live timer** — start/stop one task at a time with `w`; totals (`H:MM`) show on rows and in the editor, and survive restarts.
 - **Calendar pane** — month grid with a keyboard cursor for jumping to any day.
 - **Detail editor** — title, priority (low/medium/high), due moment, tags, and free-text multiline notes, all in-app.
-- **CLI companion** — `add` / `done` / `list` / `search` / `show` / `tags` / `stats` / `export` share the storage layer for capture and inspection without the TUI, with optional `--json` for scripts.
+- **CLI companion** — `add` / `done` / `reopen` / `update` / `rm` / `list` / `search` / `show` / `tags` / `stats` / `export` / `capabilities` share the storage layer for capture and inspection without the TUI, with optional `--json` for scripts and agents.
 - **Export** — one-way JSON (full fidelity) and readable markdown; no data lock-in.
 - **VS Code Dark Modern theme** — a single palette applied across every widget.
 - **Local-first storage** — embedded SQLite, no setup beyond launching.
@@ -122,7 +129,7 @@ Tagged releases publish prebuilt binaries for Windows, Linux, and macOS on the
 ### Your first session
 
 1. **Launch** — `cargo run --release`. You see today's (empty) list, the October-style month
-   calendar on the left, and the key hints at the bottom.
+   calendar on the left, the day Summary beneath it, and the key hints at the bottom.
 2. **Add a task** — press `a`, type `Buy milk`, press `Enter`. The task appears in today's list.
 3. **Complete it** — with the task selected, press `x`. It stays in the list, struck through.
    Press `x` again to reopen it.
@@ -132,6 +139,8 @@ Tagged releases publish prebuilt binaries for Windows, Linux, and macOS on the
 
 - **Move** with `j`/`k` or `↑`/`↓`.
 - **Toggle** any task with `x` or `Space`.
+- **Delete** the selected task with `d`; **undo** the most recent delete with `u`. Undo holds one
+  task in memory and lasts for the session — quit and it is gone.
 - **Start/stop a timer** with `w`. Only one timer runs at a time — starting on another task banks
   the first one's elapsed seconds first, and quitting banks the running segment. Totals show as
   `H:MM` on the row and in the editor.
@@ -146,6 +155,20 @@ Tagged releases publish prebuilt binaries for Windows, Linux, and macOS on the
   - `Ctrl+S` saves from any field; `Esc` discards and closes.
 - Clearing a title to blank discards the edit instead of saving an empty task.
 
+### The day Summary
+
+Beneath the Calendar, a Summary describes exactly what is rendered beside it — it is built from
+the same data the list draws from, so it can never disagree with what you are looking at:
+
+- **Missed due**, **Due today**, and **Overdue** counts, matching those sections.
+- The viewed day's **Done** fraction.
+- **Tracked**: total time on what is on screen, including a running timer's live segment.
+- **High open**: how many unfinished tasks are high priority. A task that appears in two sections
+  (say Missed due and Overdue) is counted once.
+
+It needs no keybinding, updates live, and narrows with the tag filter — its title names the filter
+(`Summary — #work`) so the figures are never ambiguous.
+
 ### Tags, deadlines, and time
 
 - **Filter by tag** — press `f` to cycle through the tags in use; every section narrows to the
@@ -155,6 +178,19 @@ Tagged releases publish prebuilt binaries for Windows, Linux, and macOS on the
   fires a desktop toast for anything already past due.
 - **Timers** persist: accumulated seconds are stored, so closing and reopening never loses
   tracked time.
+
+### Search
+
+Press `/` to search task titles and notes across **every** day — the one view that is not scoped
+to a single Day list.
+
+- Type to narrow the results live; `Backspace` edits the query.
+- Results group by day, and each row shows the day it belongs to.
+- `Enter` moves from the query to the results; `/` returns to the query; `Esc` goes back to the
+  Day list and clears the query.
+- A result behaves exactly like a Day-list row: `j`/`k` move, `x` toggles, `d`/`u` delete and
+  undo, `e` edits, `w` runs the timer.
+- A blank query shows nothing rather than everything, and says so.
 
 ### Navigating days
 
@@ -299,7 +335,7 @@ src/
   main.rs    CLI args, startup, dispatch (TUI vs subcommands)
   cli.rs     Non-interactive surface: parse args → command; execute via storage
   app.rs     Pure state machine (messages → state + effects), unit-tested
-  db.rs      SQLite storage seam (day queries, overdue, due, tags, timer)
+  db.rs      SQLite storage seam (day queries, overdue, due, tags, timer, delete/restore, search)
   json.rs    Hand-rolled JSON writer + Agent envelope for --json output
   model.rs   Domain types + formatting (tags, due input, H:MM totals)
   theme.rs   Single VS Code Dark Modern palette
