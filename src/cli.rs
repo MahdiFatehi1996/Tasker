@@ -1,4 +1,5 @@
-//! Non-interactive command-line surface: `add` / `done` / `list` / `export`.
+//! Non-interactive command-line surface: `add` / `done` / `rm` / `list` /
+//! `export`.
 //!
 //! Shares the storage seam with the TUI — every command reads and writes
 //! through [`Database`], never SQLite directly, and resolves the database
@@ -101,6 +102,11 @@ pub enum Command {
         /// The task id to complete.
         id: i64,
     },
+    /// Delete task `id`.
+    Remove {
+        /// The task id to delete.
+        id: i64,
+    },
     /// Print today's view (sections + rows).
     List,
     /// Export tasks; `day` selects the markdown log day (markdown only).
@@ -117,6 +123,7 @@ pub const USAGE: &str = "\
 tasker [--db <path>]                       launch the TUI
 tasker add \"title\"                        add a task to today
 tasker done <id>                           mark a task done
+tasker rm <id>                             delete a task
 tasker list                                print today's view
 tasker export --format json|markdown       dump all tasks or log a day
                 [--day YYYY-MM-DD]         (markdown: day to log)";
@@ -166,6 +173,15 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
                 .map(|id| Command::Done { id })
                 .map_err(|_| {
                     CommandError::usage(format!("done needs a numeric task id, got: {raw}"))
+                }),
+        },
+        Some("rm") => match positional.get(1) {
+            None => Err(CommandError::usage("rm needs a task id")),
+            Some(raw) => raw
+                .parse::<i64>()
+                .map(|id| Command::Remove { id })
+                .map_err(|_| {
+                    CommandError::usage(format!("rm needs a numeric task id, got: {raw}"))
                 }),
         },
         Some("list") => Ok(Command::List),
@@ -234,6 +250,7 @@ pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> 
         Command::Tui => Ok(String::new()),
         Command::Add { title } => add(db, &title),
         Command::Done { id } => done(db, id),
+        Command::Remove { id } => remove(db, id),
         Command::List => list(db),
         Command::Export { format, day } => export(db, format, day),
     }
@@ -255,6 +272,16 @@ fn done(db: &Database, id: i64) -> Result<String, CommandError> {
     task.done = true;
     db.update_task(&task).map_err(storage)?;
     Ok(format!("Done task {id}: {}", task.title))
+}
+
+/// Delete task `id`; an unknown id is a not-found error.
+fn remove(db: &Database, id: i64) -> Result<String, CommandError> {
+    let task = db
+        .task_by_id(id)
+        .map_err(storage)?
+        .ok_or_else(|| CommandError::not_found(format!("no task with id {id}")))?;
+    db.delete_task(id).map_err(storage)?;
+    Ok(format!("Removed task {id}: {}", task.title))
 }
 
 /// Today's view as plain text: missed-due, due-today, overdue, then the day,
@@ -409,6 +436,16 @@ mod tests {
         );
         assert!(parse_args(&args(&["done"])).is_err());
         assert!(parse_args(&args(&["done", "abc"])).is_err());
+    }
+
+    #[test]
+    fn rm_requires_a_numeric_id() {
+        assert_eq!(
+            parse_args(&args(&["rm", "42"])),
+            Ok((None, Command::Remove { id: 42 }))
+        );
+        assert!(parse_args(&args(&["rm"])).is_err());
+        assert!(parse_args(&args(&["rm", "abc"])).is_err());
     }
 
     #[test]
@@ -633,6 +670,30 @@ mod tests {
         assert!(output.contains(&id.to_string()));
         assert!(db.task_by_id(id).expect("load").expect("exists").done);
         assert!(execute(&db, Command::Done { id: 9999 }).is_err());
+    }
+
+    #[test]
+    fn rm_deletes_the_task_and_reports_it() {
+        let db = seeded_db();
+        let id = db.all_tasks().expect("list")[0].id;
+
+        let output = execute(&db, Command::Remove { id }).expect("rm");
+
+        assert!(output.contains(&id.to_string()), "{output}");
+        assert!(output.contains("Quarterly report"), "{output}");
+        assert!(db.task_by_id(id).expect("load").is_none());
+    }
+
+    #[test]
+    fn rm_unknown_id_is_a_not_found_error() {
+        let db = seeded_db();
+        let error = execute(&db, Command::Remove { id: 9999 }).expect_err("unknown id");
+        assert!(matches!(&error, CommandError::NotFound(_)), "{error:?}");
+        assert_eq!(
+            exit_code(&Err(error)),
+            1,
+            "not-found keeps today's exit code"
+        );
     }
 
     #[test]
