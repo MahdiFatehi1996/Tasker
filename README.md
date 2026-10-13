@@ -183,7 +183,12 @@ A bare `tasker` launches the TUI; any subcommand runs non-interactively against 
 
 ```sh
 tasker add "Buy milk"                                # add a task to today
+tasker add "Ship report" --day 2026-10-15 --priority high \
+    --due "2026-10-15 17:00" --tags "work, admin" --notes "before EOD"
 tasker done 3                                        # mark task 3 done
+tasker reopen 3                                      # clear task 3's done state
+tasker update 3 --title "Buy oat milk"               # change one field, leaving the rest
+tasker update 3 --due ""                             # a blank --due clears the deadline
 tasker rm 4                                          # delete task 4
 tasker list                                          # print today's view (sections + rows)
 tasker list --json                                   # the four sections as an envelope
@@ -196,13 +201,19 @@ tasker export --format markdown --day 2026-10-08     # readable log of one day
 tasker capabilities --json                           # report the contract + schema versions
 ```
 
-`add` / `done` / `rm` print a one-line confirmation; `list` mirrors the TUI's Missed-due /
-Due-today / Overdue / Today sections; `export` writes to stdout so you can pipe it anywhere.
+`add` captures a well-formed task in one call: `--day`, `--priority`, `--due`, `--tags`, and
+`--notes` are all optional, and an invalid `--due` or `--priority` is a usage error rather than a
+silent default. `add` and `update` titles may begin with dashes after a `--` terminator.
+`update` changes only the fields you pass and leaves every other field untouched, so a concurrent
+edit is not clobbered. Writes print a one-line confirmation by default; `list` mirrors the TUI's
+Missed-due / Due-today / Overdue / Today sections; `export` writes to stdout so you can pipe it
+anywhere.
 
-Every read command has a machine-readable form behind `--json`, with human text unchanged
-and the default. **Collections** (`list`, `tags`, `capabilities`) are wrapped in an envelope
-carrying the contract and schema versions around a `payload`; **`show` is the exception** — a
-single Task is a bare JSON object, not an envelope:
+Every command has a machine-readable form behind `--json`, with human text unchanged and the
+default. **Collections** (`list`, `tags`, `capabilities`) are wrapped in an envelope carrying the
+contract and schema versions around a `payload`; a **single Task is a bare JSON object**, not an
+envelope — that is `show` and every write command (`add`, `done`, `update`, `reopen`, `rm`), which
+emit the Task they produced or removed:
 
 ```json
 {
