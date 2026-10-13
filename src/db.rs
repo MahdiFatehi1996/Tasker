@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveDateTime};
-use rusqlite::Connection;
+use rusqlite::{Connection, functions::FunctionFlags};
 
 use crate::model::{NewTask, Priority, Task, normalize_tag, normalize_tags};
 
@@ -131,6 +131,20 @@ fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
     // `journal_mode` persists on the file; in-memory databases report "memory"
     // and simply ignore the request.
     conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    // Case-insensitive search needs a lowercase that folds the whole string,
+    // not just ASCII: SQLite's built-in `lower()` leaves accented capitals
+    // untouched, so a mixed-case non-ASCII query would silently miss. The
+    // storage seam registers one deterministic, Unicode-aware fold for
+    // `search_tasks`, so both surfaces share the same matching rule.
+    conn.create_scalar_function(
+        "tasker_lower",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text: String = ctx.get(0)?;
+            Ok(text.to_lowercase())
+        },
+    )?;
     Ok(())
 }
 
@@ -375,6 +389,27 @@ impl Database {
         self.collect_with_tags(
             &format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY day, id"),
             [],
+        )
+    }
+
+    /// Cross-day search over task titles and notes, case-insensitively:
+    /// a Task can be found without knowing the day it was pinned to.
+    /// Results are ordered by day then id — the order they group in — so the
+    /// TUI and the CLI render the same sections. A blank query matches
+    /// nothing; the scan is a simple substring test, no index required.
+    pub fn search_tasks(&self, query: &str) -> Result<Vec<Task>, Error> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.collect_with_tags(
+            &format!(
+                "SELECT {TASK_COLUMNS} FROM tasks \
+                 WHERE instr(tasker_lower(title), ?1) > 0 \
+                    OR instr(tasker_lower(notes), ?1) > 0 \
+                 ORDER BY day, id"
+            ),
+            [needle],
         )
     }
 
@@ -1413,5 +1448,79 @@ mod tests {
                 .expect("parent has a name"),
             "tasker"
         );
+    }
+
+    /// Save a task pinned to `day` with the given title/notes (all other
+    /// fields default) and return its id.
+    fn save(db: &Database, day: NaiveDate, title: &str, notes: &str) -> i64 {
+        db.save_task(&NewTask {
+            day,
+            title: title.to_string(),
+            priority: Priority::Medium,
+            notes: notes.to_string(),
+            due: None,
+            tags: Vec::new(),
+        })
+        .expect("save task")
+    }
+
+    #[test]
+    fn search_matches_titles_and_notes_case_insensitively_across_days() {
+        let db = memory_db();
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        let later = NaiveDate::from_ymd_opt(2026, 10, 12).expect("valid date");
+        let title_hit = save(&db, later, "Pay the Rent", "");
+        let other_title_hit = save(&db, earlier, "RENT receipt", "");
+        let notes_hit = save(&db, earlier, "unrelated", "remember the rent");
+        save(&db, earlier, "Groceries", "eggs and milk");
+
+        let hits = db.search_tasks("rent").expect("search rent");
+        assert_eq!(hits.len(), 3, "title and notes hits, across days");
+        assert_eq!(
+            hits.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![other_title_hit, notes_hit, title_hit],
+            "ordered by day then id, the order results group in"
+        );
+        assert_eq!(
+            hits.last().expect("a hit").day,
+            later,
+            "a title match on a later day is included"
+        );
+
+        let upper = db.search_tasks("RENT").expect("search upper");
+        assert_eq!(upper, hits, "the query itself is case-insensitive");
+    }
+
+    #[test]
+    fn search_matches_non_ascii_case_differences() {
+        let db = memory_db();
+        save(&db, test_day(), "CAFÉ meeting", "");
+        save(&db, test_day(), "coffee", "mündlich");
+
+        assert_eq!(
+            db.search_tasks("café").expect("lower query").len(),
+            1,
+            "a lowercase non-ASCII query matches an uppercase non-ASCII title"
+        );
+        assert_eq!(
+            db.search_tasks("MÜNDLICH").expect("upper query").len(),
+            1,
+            "an uppercase non-ASCII query matches a lowercase non-ASCII note"
+        );
+    }
+
+    #[test]
+    fn search_with_a_blank_query_matches_nothing() {
+        let db = memory_db();
+        save(&db, test_day(), "Something", "some notes");
+        assert!(db.search_tasks("").expect("empty").is_empty());
+        assert!(db.search_tasks("   ").expect("whitespace").is_empty());
+    }
+
+    #[test]
+    fn search_with_no_match_returns_empty() {
+        let db = memory_db();
+        save(&db, test_day(), "Something", "some notes");
+        assert!(db.search_tasks("nothing here").expect("query").is_empty());
     }
 }

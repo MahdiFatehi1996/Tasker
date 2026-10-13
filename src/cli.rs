@@ -109,6 +109,11 @@ pub enum Command {
     },
     /// Print today's view (sections + rows).
     List,
+    /// Print tasks whose title or notes match `query`, across every day.
+    Search {
+        /// The search query (trimmed; must be non-blank).
+        query: String,
+    },
     /// Export tasks; `day` selects the markdown log day (markdown only).
     Export {
         /// Output format.
@@ -125,6 +130,7 @@ tasker add \"title\"                        add a task to today
 tasker done <id>                           mark a task done
 tasker rm <id>                             delete a task
 tasker list                                print today's view
+tasker search \"query\"                      find tasks by title or notes
 tasker export --format json|markdown       dump all tasks or log a day
                 [--day YYYY-MM-DD]         (markdown: day to log)";
 
@@ -185,6 +191,14 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
                 }),
         },
         Some("list") => Ok(Command::List),
+        Some("search") => {
+            let query = positional[1..].join(" ").trim().to_string();
+            if query.is_empty() {
+                Err(CommandError::usage("search needs a query"))
+            } else {
+                Ok(Command::Search { query })
+            }
+        }
         Some("export") => parse_export(&positional[1..]),
         Some(other) => Err(CommandError::usage(format!("unknown command: {other}"))),
     }
@@ -252,6 +266,7 @@ pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> 
         Command::Done { id } => done(db, id),
         Command::Remove { id } => remove(db, id),
         Command::List => list(db),
+        Command::Search { query } => search(db, &query),
         Command::Export { format, day } => export(db, format, day),
     }
 }
@@ -336,6 +351,31 @@ fn list_line(task: &Task) -> String {
         line.push_str(&format!("  {}", format_tracked(task.tracked_secs)));
     }
     line
+}
+
+/// Cross-day search as readable text, one heading per day so a Task's Day
+/// list is legible without knowing it beforehand. No matches is its own
+/// message, distinct from an empty day.
+fn search(db: &Database, query: &str) -> Result<String, CommandError> {
+    let tasks = db.search_tasks(query).map_err(storage)?;
+    if tasks.is_empty() {
+        return Ok(format!("No matches for \"{query}\"."));
+    }
+    let mut out = String::new();
+    let mut day: Option<NaiveDate> = None;
+    for task in &tasks {
+        if day != Some(task.day) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&task.day.format("%Y-%m-%d").to_string());
+            out.push('\n');
+            day = Some(task.day);
+        }
+        out.push_str(&list_line(task));
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 fn export(
@@ -725,6 +765,77 @@ mod tests {
             execute(&db, Command::List).expect("list"),
             "No tasks today."
         );
+    }
+
+    #[test]
+    fn search_collects_and_trims_the_query() {
+        assert_eq!(
+            parse_args(&args(&["search", "pay", "rent"])),
+            Ok((
+                None,
+                Command::Search {
+                    query: "pay rent".to_string()
+                }
+            ))
+        );
+        assert!(parse_args(&args(&["search"])).is_err());
+        assert!(parse_args(&args(&["search", "   "])).is_err());
+    }
+
+    #[test]
+    fn search_prints_matching_tasks_grouped_by_day() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        db.save_task(&NewTask {
+            day: earlier,
+            title: "Pay the Rent".to_string(),
+            priority: Priority::Medium,
+            notes: String::new(),
+            due: None,
+            tags: Vec::new(),
+        })
+        .expect("save title match");
+        db.save_task(&NewTask {
+            day: day(),
+            title: "Groceries".to_string(),
+            priority: Priority::Medium,
+            notes: "remember the rent".to_string(),
+            due: None,
+            tags: Vec::new(),
+        })
+        .expect("save notes match");
+
+        let output = execute(
+            &db,
+            Command::Search {
+                query: "RENT".to_string(),
+            },
+        )
+        .expect("search");
+
+        assert!(output.contains("Pay the Rent"), "{output}");
+        assert!(output.contains("Groceries"), "{output}");
+        assert!(
+            output.contains("2026-10-08"),
+            "earlier day heading:\n{output}"
+        );
+        assert!(
+            output.contains("2026-10-10"),
+            "later day heading:\n{output}"
+        );
+    }
+
+    #[test]
+    fn search_with_no_match_says_so() {
+        let db = seeded_db();
+        let output = execute(
+            &db,
+            Command::Search {
+                query: "zzz".to_string(),
+            },
+        )
+        .expect("search");
+        assert!(output.contains("No matches"), "{output}");
     }
 
     #[test]

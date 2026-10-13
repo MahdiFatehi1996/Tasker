@@ -12,13 +12,17 @@ use crate::model::{
     parse_tags_input,
 };
 
-/// Input mode: browsing the day list, composing a new task, or editing one.
+/// Input mode: browsing the day list, composing a new task, editing one, or
+/// searching across days. Search is a distinct view, not a day-scoped one:
+/// while active it has two phases — typing the query, then navigating and
+/// acting on the grouped results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
     Browse,
     Adding,
     Detail,
+    Search,
 }
 
 /// Field focused in the detail editor.
@@ -78,12 +82,20 @@ enum Section {
 }
 
 /// Single-level, in-memory undo buffer: the most recently deleted task and
-/// the section it came from, so a restore puts it back where it was. Replaced
-/// on the next delete, dropped when the session ends. Never persisted.
+/// where it was deleted from, so a restore puts it back where it was.
+/// Replaced on the next delete, dropped when the session ends. Never persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UndoEntry {
     task: Task,
-    section: Section,
+    origin: UndoOrigin,
+}
+
+/// Where a deleted task was showing: a day-list section, or the cross-day
+/// Search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndoOrigin {
+    Section(Section),
+    Search,
 }
 
 /// In-progress edit of one task: drafts plus the snapshot they came from
@@ -244,6 +256,24 @@ pub enum Message {
     CycleTagFilter,
     /// Clear the tag filter and restore the full list (`Esc`).
     ClearTagFilter,
+    /// Open cross-day Search (`/`): a fresh, empty query with the query
+    /// field focused. Search is not tag-scoped, so any tag filter clears.
+    BeginSearch,
+    /// Focus the Search query field again (`/` while navigating results).
+    RefocusSearch,
+    /// Type into the Search query (narrows the results live).
+    SearchChar(char),
+    /// Delete the last character of the Search query.
+    SearchBackspace,
+    /// Finish typing the query and start navigating the results (Enter).
+    /// A no-op while the query is blank, so there is never a half-state.
+    SearchSubmit,
+    /// Leave Search for the Day list and clear the query (`Esc`).
+    ExitSearch,
+    /// Move the selection down the Search results.
+    SearchSelectNext,
+    /// Move the selection up the Search results.
+    SearchSelectPrev,
     /// Toggle the work timer on the selected task (`w`). `now` rides along so
     /// pure state never reads a clock. Starting while another task runs banks
     /// the running task's elapsed seconds first (single running timer).
@@ -298,6 +328,15 @@ pub struct App {
     cursor: NaiveDate,
     help_open: bool,
     should_quit: bool,
+    /// Cross-day Search state: the query, whether the query field is focused,
+    /// the results (ordered by day then id), and the selection over them.
+    search_query: String,
+    search_editing: bool,
+    search_results: Vec<Task>,
+    search_selected: usize,
+    /// Mode to restore when the detail editor closes: Browse from the Day
+    /// list, Search from the results.
+    editor_return: Mode,
 }
 
 impl App {
@@ -324,6 +363,11 @@ impl App {
             calendar_focused: false,
             help_open: false,
             should_quit: false,
+            search_query: String::new(),
+            search_editing: false,
+            search_results: Vec::new(),
+            search_selected: 0,
+            editor_return: Mode::Browse,
         };
         app.set_tasks(tasks);
         app.set_overdue(overdue);
@@ -473,15 +517,28 @@ impl App {
         self.selected = self.selected.min(self.combined_len().saturating_sub(1));
     }
 
-    /// Task under the selection cursor, if the visible (filtered) combined
-    /// list is non-empty.
+    /// Task under the selection cursor in the active view, if any: the
+    /// selected Search result while Search is active, else the selected row
+    /// of the visible (filtered) combined day list.
     pub fn selected_task(&self) -> Option<&Task> {
+        if self.mode == Mode::Search {
+            self.search_results.get(self.search_selected)
+        } else {
+            self.day_selected_task()
+        }
+    }
+
+    /// Day-list selection cursor resolution (Search has its own indexing).
+    fn day_selected_task(&self) -> Option<&Task> {
         let (section, row) = self.split_index(self.selected);
         self.filtered_in(section).into_iter().nth(row)
     }
 
     fn selected_task_mut(&mut self) -> Option<&mut Task> {
-        let id = self.selected_task().map(|task| task.id)?;
+        if self.mode == Mode::Search {
+            return self.search_results.get_mut(self.search_selected);
+        }
+        let id = self.day_selected_task().map(|task| task.id)?;
         [
             &mut self.missed_due,
             &mut self.due_today,
@@ -507,6 +564,48 @@ impl App {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// The active Search query (`""` when not searching).
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    /// Whether Search is active and the query field holds focus (typing
+    /// narrows the results); `false` means the results are navigable.
+    pub fn search_editing(&self) -> bool {
+        self.search_editing
+    }
+
+    /// The cross-day Search results, ordered by day then id.
+    pub fn search_results(&self) -> &[Task] {
+        &self.search_results
+    }
+
+    /// Selection index over the Search results.
+    #[allow(dead_code)]
+    pub fn search_selected(&self) -> usize {
+        self.search_selected
+    }
+
+    /// Cursor row within the Search group for `day`, if the selection points
+    /// into it.
+    pub fn search_cursor_in(&self, day: NaiveDate) -> Option<usize> {
+        let offset = self
+            .search_results
+            .iter()
+            .filter(|task| task.day < day)
+            .count();
+        let in_day = self
+            .search_results
+            .iter()
+            .filter(|task| task.day == day)
+            .count();
+        if in_day == 0 {
+            return None;
+        }
+        let local = self.search_selected.checked_sub(offset)?;
+        (local < in_day).then_some(local)
     }
 
     pub fn draft(&self) -> &str {
@@ -580,6 +679,28 @@ impl App {
         self.clamp_selection();
     }
 
+    /// Replace the Search results (storage order: day then id), keeping the
+    /// Search selection on a valid row.
+    pub fn set_search_results(&mut self, results: Vec<Task>) {
+        self.search_results = results;
+        self.clamp_search_selection();
+    }
+
+    fn clamp_search_selection(&mut self) {
+        self.search_selected = self
+            .search_selected
+            .min(self.search_results.len().saturating_sub(1));
+    }
+
+    /// Move the Search selection by `step`, wrapping over the results.
+    fn move_search_selection(&mut self, step: isize) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        let len = self.search_results.len() as isize;
+        self.search_selected = (self.search_selected as isize + step).rem_euclid(len) as usize;
+    }
+
     /// Replace the known tag names (the filter cycle order). A filter
     /// pointing at a vanished tag clears, so focus mode never strands the
     /// list on an empty tag.
@@ -596,6 +717,16 @@ impl App {
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.draft.clear();
+    }
+
+    /// Close the detail editor and return to the view it was opened from:
+    /// the Day list, or the Search results (in result-navigation phase).
+    fn finish_edit(&mut self) {
+        let target = self.editor_return;
+        if target == Mode::Search {
+            self.search_editing = false;
+        }
+        self.set_mode(target);
     }
 
     /// Shift a day, saturating at the calendar edge (unreachable in practice).
@@ -617,7 +748,7 @@ impl App {
         let Some(editor) = self.editor.take() else {
             return vec![];
         };
-        self.set_mode(Mode::Browse);
+        self.finish_edit();
         if is_blank_title(&editor.title) || !editor.has_changes() {
             return vec![];
         }
@@ -710,21 +841,42 @@ impl App {
                 None => vec![],
             },
             Message::DeleteSelected => {
+                if self.mode == Mode::Search {
+                    if self.search_selected >= self.search_results.len() {
+                        return vec![];
+                    }
+                    let task = self.search_results.remove(self.search_selected);
+                    let task_id = task.id;
+                    self.undo = Some(UndoEntry {
+                        task,
+                        origin: UndoOrigin::Search,
+                    });
+                    self.clamp_search_selection();
+                    return vec![Effect::Delete { task_id }];
+                }
                 let Some(task) = self.selected_task().cloned() else {
                     return vec![];
                 };
                 let (section, _) = self.split_index(self.selected);
                 let task_id = task.id;
                 self.section_tasks_mut(section).retain(|t| t.id != task_id);
-                self.undo = Some(UndoEntry { task, section });
+                self.undo = Some(UndoEntry {
+                    task,
+                    origin: UndoOrigin::Section(section),
+                });
                 self.clamp_selection();
                 vec![Effect::Delete { task_id }]
             }
             Message::UndoDelete => match self.undo.take() {
                 Some(entry) => {
-                    self.section_tasks_mut(entry.section)
-                        .push(entry.task.clone());
+                    match entry.origin {
+                        UndoOrigin::Section(section) => {
+                            self.section_tasks_mut(section).push(entry.task.clone())
+                        }
+                        UndoOrigin::Search => self.search_results.push(entry.task.clone()),
+                    }
                     self.clamp_selection();
+                    self.clamp_search_selection();
                     vec![Effect::Restore(entry.task)]
                 }
                 None => vec![],
@@ -792,6 +944,7 @@ impl App {
             }
             Message::BeginEdit => match self.selected_task().cloned() {
                 Some(task) => {
+                    self.editor_return = self.mode;
                     self.editor = Some(EditorState::new(&task));
                     self.set_mode(Mode::Detail);
                     vec![]
@@ -853,7 +1006,7 @@ impl App {
             Message::CancelEdit => {
                 if self.editor.is_some() {
                     self.editor = None;
-                    self.set_mode(Mode::Browse);
+                    self.finish_edit();
                 }
                 vec![]
             }
@@ -880,6 +1033,67 @@ impl App {
             Message::ClearTagFilter => {
                 self.tag_filter = None;
                 self.clamp_selection();
+                vec![]
+            }
+            Message::BeginSearch => {
+                self.mode = Mode::Search;
+                self.search_query.clear();
+                self.search_editing = true;
+                self.search_results.clear();
+                self.search_selected = 0;
+                self.calendar_focused = false;
+                // Search is deliberately not day- or tag-scoped.
+                self.tag_filter = None;
+                vec![]
+            }
+            Message::RefocusSearch => {
+                if self.mode == Mode::Search {
+                    self.search_editing = true;
+                }
+                vec![]
+            }
+            Message::SearchChar(c) => {
+                if self.mode == Mode::Search && self.search_editing {
+                    self.search_query.push(c);
+                    self.search_selected = 0;
+                    return vec![Effect::Reload];
+                }
+                vec![]
+            }
+            Message::SearchBackspace => {
+                if self.mode == Mode::Search && self.search_editing {
+                    self.search_query.pop();
+                    self.search_selected = 0;
+                    return vec![Effect::Reload];
+                }
+                vec![]
+            }
+            Message::SearchSubmit => {
+                if self.mode == Mode::Search
+                    && self.search_editing
+                    && !self.search_query.trim().is_empty()
+                {
+                    self.search_editing = false;
+                    self.search_selected = 0;
+                }
+                vec![]
+            }
+            Message::ExitSearch => {
+                if self.mode == Mode::Search {
+                    self.mode = Mode::Browse;
+                    self.search_query.clear();
+                    self.search_results.clear();
+                    self.search_editing = false;
+                    self.search_selected = 0;
+                }
+                vec![]
+            }
+            Message::SearchSelectNext => {
+                self.move_search_selection(1);
+                vec![]
+            }
+            Message::SearchSelectPrev => {
+                self.move_search_selection(-1);
                 vec![]
             }
             Message::ToggleTimer(now) => self.toggle_timer(now),
@@ -1974,5 +2188,209 @@ mod tests {
         assert!(app.help_open());
         assert_eq!(app.update(Message::ToggleHelp), vec![]);
         assert!(!app.help_open());
+    }
+
+    fn search_app() -> App {
+        let mut app = three_tasks();
+        app.update(Message::BeginSearch);
+        app.set_search_results(vec![task(1, "one"), task(2, "two"), task(3, "three")]);
+        app
+    }
+
+    #[test]
+    fn begin_search_enters_search_with_an_empty_query() {
+        let mut app = three_tasks();
+        assert_eq!(app.update(Message::BeginSearch), vec![]);
+        assert_eq!(app.mode(), Mode::Search);
+        assert_eq!(app.search_query(), "");
+        assert!(app.search_editing(), "the query field is focused first");
+        assert!(!app.calendar_focused(), "search leaves the calendar");
+    }
+
+    #[test]
+    fn typing_a_query_narrows_live_and_backspace_undoes() {
+        let mut app = three_tasks();
+        app.update(Message::BeginSearch);
+        assert_eq!(
+            app.update(Message::SearchChar('r')),
+            vec![Effect::Reload],
+            "each keystroke asks the runtime to re-run the query"
+        );
+        app.update(Message::SearchChar('e'));
+        assert_eq!(app.search_query(), "re");
+        assert_eq!(app.update(Message::SearchBackspace), vec![Effect::Reload]);
+        assert_eq!(app.search_query(), "r");
+    }
+
+    #[test]
+    fn search_char_is_ignored_outside_query_entry() {
+        let mut app = search_app();
+        app.update(Message::SearchChar('x'));
+        app.update(Message::SearchSubmit); // stop editing
+        assert_eq!(app.update(Message::SearchChar('z')), vec![]);
+        assert_eq!(app.search_query(), "x");
+    }
+
+    #[test]
+    fn search_submit_starts_result_navigation_only_for_a_non_blank_query() {
+        let mut app = search_app();
+        assert_eq!(
+            app.update(Message::SearchSubmit),
+            vec![],
+            "blank is a no-op"
+        );
+        assert!(app.search_editing(), "the query field stays focused");
+
+        app.update(Message::SearchChar('x'));
+        assert_eq!(app.update(Message::SearchSubmit), vec![]);
+        assert!(!app.search_editing(), "results are now navigable");
+    }
+
+    #[test]
+    fn exit_search_returns_to_the_day_list_and_clears_the_query() {
+        let mut app = search_app();
+        app.update(Message::SearchChar('x'));
+        assert_eq!(app.update(Message::ExitSearch), vec![]);
+        assert_eq!(app.mode(), Mode::Browse);
+        assert_eq!(app.search_query(), "");
+        assert!(app.search_results().is_empty());
+        assert_eq!(app.search_selected(), 0);
+    }
+
+    #[test]
+    fn search_selection_wraps_over_the_results() {
+        let mut app = search_app();
+        assert_eq!(app.search_selected(), 0);
+        assert_eq!(app.update(Message::SearchSelectNext), vec![]);
+        assert_eq!(app.search_selected(), 1);
+        app.update(Message::SearchSelectPrev);
+        assert_eq!(app.search_selected(), 0);
+        app.update(Message::SearchSelectPrev);
+        assert_eq!(app.search_selected(), 2, "wraps to the last result");
+    }
+
+    #[test]
+    fn search_selection_clamps_when_results_shrink() {
+        let mut app = search_app();
+        app.update(Message::SearchSelectNext);
+        app.update(Message::SearchSelectNext);
+        assert_eq!(app.search_selected(), 2);
+        app.set_search_results(vec![task(1, "one")]);
+        assert_eq!(app.search_selected(), 0);
+    }
+
+    #[test]
+    fn search_result_toggles_done_like_a_day_list_row() {
+        let mut app = search_app();
+        app.update(Message::SearchSelectNext);
+        let effects = app.update(Message::ToggleSelected);
+
+        assert!(app.search_results()[1].done);
+        assert_eq!(
+            effects,
+            vec![Effect::Update(Task {
+                done: true,
+                ..task(2, "two")
+            })]
+        );
+    }
+
+    #[test]
+    fn search_result_deletes_and_undoes() {
+        let mut app = search_app();
+        app.update(Message::SearchSelectNext);
+
+        let effects = app.update(Message::DeleteSelected);
+
+        assert_eq!(effects, vec![Effect::Delete { task_id: 2 }]);
+        assert_eq!(app.search_results().len(), 2);
+        assert!(app.search_results().iter().all(|t| t.id != 2));
+
+        let effects = app.update(Message::UndoDelete);
+        assert_eq!(effects, vec![Effect::Restore(task(2, "two"))]);
+        assert!(
+            app.search_results().iter().any(|t| t.id == 2),
+            "undo puts the result back where it was found"
+        );
+    }
+
+    #[test]
+    fn search_result_edits_and_returns_to_the_results() {
+        let mut app = search_app();
+        assert_eq!(app.update(Message::BeginEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Detail);
+        assert_eq!(app.editor().expect("editor open").title, "one");
+
+        app.update(Message::EditChar('!'));
+        let effects = app.update(Message::CommitEdit);
+
+        assert_eq!(
+            effects,
+            vec![Effect::Update(Task {
+                title: "one!".to_string(),
+                ..task(1, "one")
+            })]
+        );
+        assert_eq!(app.mode(), Mode::Search, "edit returns to the results");
+        assert!(!app.search_editing(), "and lands ready to act on them");
+    }
+
+    #[test]
+    fn search_result_edit_cancel_returns_to_the_results() {
+        let mut app = search_app();
+        app.update(Message::BeginEdit);
+        app.update(Message::EditChar('!'));
+        assert_eq!(app.update(Message::CancelEdit), vec![]);
+        assert_eq!(app.mode(), Mode::Search);
+    }
+
+    #[test]
+    fn search_result_runs_the_timer() {
+        let mut app = search_app();
+        app.update(Message::SearchSelectNext);
+        assert_eq!(app.update(Message::ToggleTimer(noon())), vec![]);
+        assert_eq!(app.running_task_id(), Some(2));
+    }
+
+    #[test]
+    fn day_list_edit_still_returns_to_browse() {
+        let mut app = three_tasks();
+        app.update(Message::BeginEdit);
+        app.update(Message::CancelEdit);
+        assert_eq!(app.mode(), Mode::Browse);
+    }
+
+    #[test]
+    fn refocus_search_reopens_the_query_field() {
+        let mut app = search_app();
+        app.update(Message::SearchChar('x'));
+        app.update(Message::SearchSubmit);
+        assert!(!app.search_editing());
+        assert_eq!(app.update(Message::RefocusSearch), vec![]);
+        assert!(app.search_editing());
+    }
+
+    #[test]
+    fn search_cursor_locates_a_day_group() {
+        let mut app = App::new(day(), vec![], vec![]);
+        app.update(Message::BeginSearch);
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        let mut old = task(9, "old");
+        old.day = earlier;
+        app.set_search_results(vec![old, task(1, "one"), task(2, "two")]);
+        app.update(Message::SearchSelectNext);
+        app.update(Message::SearchSelectNext);
+        assert_eq!(app.search_selected(), 2);
+        assert_eq!(app.search_cursor_in(earlier), None);
+        assert_eq!(app.search_cursor_in(day()), Some(1));
+    }
+
+    #[test]
+    fn search_ignores_the_tag_filter() {
+        let mut app = with_tags();
+        app.update(Message::CycleTagFilter);
+        assert_eq!(app.tag_filter(), Some("admin"));
+        app.update(Message::BeginSearch);
+        assert_eq!(app.tag_filter(), None, "search is not tag-scoped");
     }
 }

@@ -56,10 +56,11 @@ export. Written in Rust, with `unsafe` code forbidden at the crate level.
 - **Automatic carry-over** — overdue tasks surface in today's view flagged with their original day; completing one clears it.
 - **Due moments** — set an exact due date-time; **Due today** and **Missed due** sections surface hard commitments, and a launch toast flags anything already past due.
 - **Tags & filter** — attach multiple tags per task and cycle a one-tag filter to focus the whole list.
+- **Cross-day Search** — press `/` to find tasks by title or notes across every day; results group by day, the Summary mirrors them, and each result can be toggled, edited, deleted, or timed like a Day-list row.
 - **Live timer** — start/stop one task at a time with `w`; totals (`H:MM`) show on rows and in the editor, and survive restarts.
 - **Calendar pane** — month grid with a keyboard cursor for jumping to any day.
 - **Detail editor** — title, priority (low/medium/high), due moment, tags, and free-text multiline notes, all in-app.
-- **CLI companion** — `add` / `done` / `list` / `export` share the storage layer for capture without the TUI.
+- **CLI companion** — `add` / `done` / `list` / `search` / `export` share the storage layer for capture without the TUI.
 - **Export** — one-way JSON (full fidelity) and readable markdown; no data lock-in.
 - **VS Code Dark Modern theme** — a single palette applied across every widget.
 - **Local-first storage** — embedded SQLite, no setup beyond launching.
@@ -185,13 +186,14 @@ A bare `tasker` launches the TUI; any subcommand runs non-interactively against 
 tasker add "Buy milk"                                # add a task to today
 tasker done 3                                        # mark task 3 done
 tasker list                                          # print today's view (sections + rows)
+tasker search rent                                   # find tasks by title or notes across all days
 tasker export --format json                          # full-fidelity dump: every field
 tasker export --format markdown --day 2026-10-08     # readable log of one day
 ```
 
 `add` / `done` print a one-line confirmation; `list` mirrors the TUI's Missed-due / Due-today /
-Overdue / Today sections; `export` writes to stdout so you can pipe it anywhere. Argument errors
-print usage and exit non-zero.
+Overdue / Today sections; `search` groups matches by day; `export` writes to stdout so you can pipe
+it anywhere. Argument errors print usage and exit non-zero.
 
 ## 🗂️ Data and files
 
