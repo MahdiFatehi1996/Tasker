@@ -1,7 +1,8 @@
 //! Tasker: a TUI daily task manager with a non-interactive CLI companion.
 //!
-//! Bare `tasker` launches the TUI; `add` / `done` / `rm` / `list` / `export`
-//! run against the same storage seam. See issues #8 and #13 for the Pro spec.
+//! Bare `tasker` launches the TUI; `add` / `done` / `rm` / `list` / `show` /
+//! `tags` / `stats` / `export` run against the same storage seam. See issues
+//! #8 and #13 for the Pro spec.
 
 mod app;
 mod cli;
@@ -25,7 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(cli::exit_code(&Err(error)));
         }
     };
-    let database = Database::open(&resolve_db_path(db_arg))?;
+    let database = match Database::open(&resolve_db_path(db_arg)) {
+        Ok(database) => database,
+        Err(error) => {
+            let error = cli::CommandError::storage(error.to_string());
+            eprintln!("error: {error}");
+            std::process::exit(cli::exit_code(&Err(error)));
+        }
+    };
     match command {
         cli::Command::Tui => run_tui(&database),
         command => {
