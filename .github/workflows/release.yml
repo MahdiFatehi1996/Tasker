@@ -87,13 +87,24 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Stage binary
+      - name: Stage binary and archive
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist stage
           cp "target/${{ matrix.target }}/release/tasker${{ matrix.ext }}" \
+             "stage/tasker${{ matrix.ext }}"
+          # Raw binary, kept so existing download URLs keep working.
+          cp "stage/tasker${{ matrix.ext }}" \
              "dist/tasker-${{ matrix.target }}${{ matrix.ext }}"
+          # Archive, for package managers and plain downloads.
+          if [ "${{ matrix.ext }}" = ".exe" ]; then
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path 'stage/tasker.exe' -DestinationPath 'dist/tasker-${{ matrix.target }}.zip' -Force"
+          else
+            tar -czf "dist/tasker-${{ matrix.target }}.tar.gz" -C stage "tasker"
+          fi
+          ls -l dist
       - uses: actions/upload-artifact@v7
         with:
           name: tasker-${{ matrix.target }}
