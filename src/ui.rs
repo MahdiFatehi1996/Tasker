@@ -194,10 +194,12 @@ fn task_row(task: &Task, selected: bool, flag: Option<String>, timer: String) ->
         theme::selection()
     } else if task.done {
         theme::done()
-    } else if task.priority == Priority::High {
-        theme::alert()
     } else {
-        theme::dim()
+        match task.priority {
+            Priority::High => theme::alert(),
+            Priority::Medium => theme::warning(),
+            Priority::Low => theme::dim(),
+        }
     };
     let mut spans = vec![
         Span::styled(marker, row_style),
@@ -257,8 +259,13 @@ fn tags_flag(task: &Task) -> Option<String> {
     }
 }
 
+/// Flag rendering an overdue task's day pin; every overdue row carries one.
+fn overdue_flag(task: &Task) -> Option<String> {
+    Some(day_flag(task))
+}
+
 /// Bordered section frame in the palette: dim border, themed title, and the
-/// amber backdrop so blank rows inside the box stay on-theme.
+/// dark backdrop so blank rows inside the box stay on-theme.
 fn section_block(title: &str, title_style: Style) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -268,12 +275,108 @@ fn section_block(title: &str, title_style: Style) -> Block<'static> {
         .style(theme::text())
 }
 
+/// One section of the day-list column. The variants, in [`SECTIONS`], are the
+/// single source of the render: order, titles, styles, and the per-row flag
+/// rule all live here, and every section is drawn by the same loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    MissedDue,
+    DueToday,
+    Overdue,
+    Today,
+}
+
+/// Sections in render order, most urgent first.
+const SECTIONS: [Section; 4] = [
+    Section::MissedDue,
+    Section::DueToday,
+    Section::Overdue,
+    Section::Today,
+];
+
+impl Section {
+    /// Bordered frame title; the viewed Day list names its date.
+    fn title(self, app: &App) -> String {
+        match self {
+            Section::MissedDue => "Missed Due".to_string(),
+            Section::DueToday => "Due Today".to_string(),
+            Section::Overdue => "Overdue".to_string(),
+            Section::Today => format!("Tasker — {}", app.viewed().format("%a %b %d, %Y")),
+        }
+    }
+
+    /// Title style: Missed due keeps the error colour, the rest take the
+    /// accent so the day-list headings read as one family.
+    fn title_style(self) -> Style {
+        match self {
+            Section::MissedDue => theme::alert(),
+            _ => theme::accent(),
+        }
+    }
+
+    /// The flag drawn after a row's checkbox: the due moment in the due
+    /// sections, the day pin when overdue, the tags on the viewed day.
+    fn flag(self) -> fn(&Task) -> Option<String> {
+        match self {
+            Section::MissedDue | Section::DueToday => due_flag,
+            Section::Overdue => overdue_flag,
+            Section::Today => tags_flag,
+        }
+    }
+
+    /// Visible rows under the active tag filter.
+    fn rows(self, app: &App) -> Vec<Task> {
+        match self {
+            Section::MissedDue => app.visible_missed_due(),
+            Section::DueToday => app.visible_due_today(),
+            Section::Overdue => app.visible_overdue(),
+            Section::Today => app.visible_tasks(),
+        }
+    }
+
+    /// Row holding the selection within this section, if any.
+    fn cursor(self, app: &App) -> Option<usize> {
+        match self {
+            Section::MissedDue => app.missed_due_cursor(),
+            Section::DueToday => app.due_today_cursor(),
+            Section::Overdue => app.overdue_cursor(),
+            Section::Today => app.today_cursor(),
+        }
+    }
+
+    /// Whether the section is dropped when it has no rows. The derived
+    /// sections are omitted when empty; the viewed Day list always shows.
+    fn omitted_when_empty(self) -> bool {
+        self != Section::Today
+    }
+
+    /// Height in the vertical split: a derived section sizes to its rows;
+    /// the viewed Day list takes the remainder.
+    fn constraint(self, rows: usize) -> Constraint {
+        match self {
+            Section::Today => Constraint::Min(1),
+            _ => Constraint::Length(rows as u16 + 2),
+        }
+    }
+}
+
+/// The sections to render this frame, in order, each paired with its visible
+/// rows: the one source the day-list column draws from. An empty derived
+/// section is dropped; the viewed Day list always remains.
+fn day_sections(app: &App) -> Vec<(Section, Vec<Task>)> {
+    SECTIONS
+        .into_iter()
+        .map(|section| (section, section.rows(app)))
+        .filter(|(section, rows)| !(rows.is_empty() && section.omitted_when_empty()))
+        .collect()
+}
+
 /// Draw one frame: calendar pane left, day-list column right
 /// (Missed-due and Due-today sections when non-empty, Overdue section
 /// when non-empty, viewed day, status footer).
 fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
     // Paint the whole frame in the palette first, so any cell no widget
-    // covers still sits on the amber-phosphor backdrop.
+    // covers still sits on the dark backdrop.
     frame.render_widget(Block::default().style(theme::text()), frame.area());
 
     let calendar = month_calendar(app, today);
@@ -299,24 +402,15 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
         outer[0],
     );
 
-    // Visible rows under the active tag filter; every section below
-    // renders these, so focus mode narrows the whole column at once.
-    let missed = app.visible_missed_due();
-    let due_today = app.visible_due_today();
-    let overdue = app.visible_overdue();
-    let tasks = app.visible_tasks();
+    // One shared path draws every section: order, titles, and flags come from
+    // [`day_sections`], so an active tag filter narrows the whole column at
+    // once. A derived section with no rows is omitted.
+    let sections = day_sections(app);
 
-    let mut constraints = Vec::new();
-    if !missed.is_empty() {
-        constraints.push(Constraint::Length(missed.len() as u16 + 2));
-    }
-    if !due_today.is_empty() {
-        constraints.push(Constraint::Length(due_today.len() as u16 + 2));
-    }
-    if !overdue.is_empty() {
-        constraints.push(Constraint::Length(overdue.len() as u16 + 2));
-    }
-    constraints.push(Constraint::Min(1));
+    let mut constraints: Vec<Constraint> = sections
+        .iter()
+        .map(|(section, rows)| section.constraint(rows.len()))
+        .collect();
     if app.mode() == Mode::Detail {
         constraints.push(Constraint::Length(EDITOR_PANEL_HEIGHT));
     }
@@ -326,103 +420,35 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
         .constraints(constraints)
         .split(outer[1]);
 
-    let mut section = 0;
-    if !missed.is_empty() {
-        let cursor = app.missed_due_cursor();
-        let items: Vec<ListItem> = missed
+    for (index, (section, rows)) in sections.iter().enumerate() {
+        let cursor = section.cursor(app);
+        let items: Vec<ListItem> = rows
             .iter()
             .enumerate()
             .map(|(i, task)| {
                 task_row(
                     task,
                     Some(i) == cursor,
-                    due_flag(task),
+                    (section.flag())(task),
                     timer_display(app, task, now),
                 )
             })
             .collect();
         let list = List::new(items)
             .style(theme::text())
-            .block(section_block("Missed Due", theme::alert()));
+            .block(section_block(&section.title(app), section.title_style()));
         let mut state = ListState::default();
         state.select(cursor);
-        frame.render_stateful_widget(list, chunks[section], &mut state);
-        section += 1;
-    }
-    if !due_today.is_empty() {
-        let cursor = app.due_today_cursor();
-        let items: Vec<ListItem> = due_today
-            .iter()
-            .enumerate()
-            .map(|(i, task)| {
-                task_row(
-                    task,
-                    Some(i) == cursor,
-                    due_flag(task),
-                    timer_display(app, task, now),
-                )
-            })
-            .collect();
-        let list = List::new(items)
-            .style(theme::text())
-            .block(section_block("Due Today", theme::strong()));
-        let mut state = ListState::default();
-        state.select(cursor);
-        frame.render_stateful_widget(list, chunks[section], &mut state);
-        section += 1;
-    }
-    if !overdue.is_empty() {
-        let cursor = app.overdue_cursor();
-        let items: Vec<ListItem> = overdue
-            .iter()
-            .enumerate()
-            .map(|(i, task)| {
-                task_row(
-                    task,
-                    Some(i) == cursor,
-                    Some(day_flag(task)),
-                    timer_display(app, task, now),
-                )
-            })
-            .collect();
-        let list = List::new(items)
-            .style(theme::text())
-            .block(section_block("Overdue", theme::strong()));
-        let mut state = ListState::default();
-        state.select(cursor);
-        frame.render_stateful_widget(list, chunks[section], &mut state);
-        section += 1;
+        frame.render_stateful_widget(list, chunks[index], &mut state);
     }
 
-    let cursor = app.today_cursor();
-    let items: Vec<ListItem> = tasks
-        .iter()
-        .enumerate()
-        .map(|(i, task)| {
-            task_row(
-                task,
-                Some(i) == cursor,
-                tags_flag(task),
-                timer_display(app, task, now),
-            )
-        })
-        .collect();
-
-    let title = format!("Tasker — {}", app.viewed().format("%a %b %d, %Y"));
-    let list = List::new(items)
-        .style(theme::text())
-        .block(section_block(&title, theme::strong()));
-    let mut state = ListState::default();
-    state.select(cursor);
-    frame.render_stateful_widget(list, chunks[section], &mut state);
-    section += 1;
-
+    let mut next = sections.len();
     if app.mode() == Mode::Detail
         && let Some(editor) = app.editor()
     {
         let tracked = format_tracked(app.tracked_display(editor.original(), now));
-        frame.render_widget(editor_panel(editor, &tracked), chunks[section]);
-        section += 1;
+        frame.render_widget(editor_panel(editor, &tracked), chunks[next]);
+        next += 1;
     }
 
     let (status, help) = match app.mode() {
@@ -435,20 +461,23 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
             Line::styled("Enter commit · Esc cancel", theme::dim()),
         ),
         Mode::Browse => {
-            let total = missed.len() + due_today.len() + overdue.len() + tasks.len();
-            let done = [&missed, &due_today, &overdue, &tasks]
+            let total: usize = sections.iter().map(|(_, rows)| rows.len()).sum();
+            let done = sections
                 .iter()
-                .flat_map(|section| section.iter())
+                .flat_map(|(_, rows)| rows)
                 .filter(|task| task.done)
                 .count();
             let status = match app.tag_filter() {
                 Some(tag) => format!("[#{tag}] {done}/{total} done"),
                 None => format!("{done}/{total} done"),
             };
-            let status_style = if missed.is_empty() {
-                theme::strong()
-            } else {
+            let status_style = if sections
+                .iter()
+                .any(|(section, _)| *section == Section::MissedDue)
+            {
                 theme::alert()
+            } else {
+                theme::strong()
             };
             (
                 Line::styled(status, status_style),
@@ -465,7 +494,7 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
     };
     frame.render_widget(
         Paragraph::new(vec![status, help]).style(theme::text()),
-        chunks[section],
+        chunks[next],
     );
 
     if app.help_open() {
@@ -953,6 +982,13 @@ mod tests {
         }
     }
 
+    fn tagged_task(id: i64, title: &str, tags: &[&str]) -> Task {
+        Task {
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..task(id, title)
+        }
+    }
+
     /// Render one frame headlessly and return the backing buffer.
     fn render_frame(app: &App, now: NaiveDateTime) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(140, 40);
@@ -998,22 +1034,40 @@ mod tests {
         assert!(text.contains("Tasker — "), "day heading drawn");
         assert!(text.contains("old overdue work"), "overdue row drawn");
 
-        // The palette reaches the buffer: backdrop set, and every accent used.
-        assert_eq!(buffer[(0, 0)].bg, theme::BACKGROUND);
+        // The palette reaches the buffer: backdrop set, and every role used.
+        assert_eq!(buffer[(0, 0)].bg, theme::BACKGROUND, "backdrop painted");
         assert!(
             buffer
                 .content()
                 .iter()
-                .any(|cell| cell.fg == theme::PRIMARY),
-            "amber primary used"
+                .any(|cell| cell.fg == theme::FOREGROUND),
+            "foreground used"
         );
         assert!(
             buffer.content().iter().any(|cell| cell.fg == theme::DIM),
             "dim secondary used"
         );
         assert!(
-            buffer.content().iter().any(|cell| cell.fg == theme::ALERT),
-            "alert red used"
+            buffer.content().iter().any(|cell| cell.fg == theme::ACCENT),
+            "accent used"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme::SELECTION),
+            "selection fill used"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.fg == theme::WARNING),
+            "warning used"
+        );
+        assert!(
+            buffer.content().iter().any(|cell| cell.fg == theme::ERROR),
+            "error used"
         );
     }
 
@@ -1055,5 +1109,66 @@ mod tests {
             text.contains("undo last delete"),
             "help documents undo:\n{text}"
         );
+    }
+
+    #[test]
+    fn day_sections_render_in_one_fixed_order_with_fixed_titles() {
+        let app = smoke_app();
+        let titles: Vec<String> = day_sections(&app)
+            .iter()
+            .map(|(section, _)| section.title(&app))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Missed Due".to_string(),
+                "Due Today".to_string(),
+                "Overdue".to_string(),
+                format!("Tasker — {}", day().format("%a %b %d, %Y")),
+            ]
+        );
+    }
+
+    #[test]
+    fn day_sections_omit_empty_derived_sections_but_keep_the_day_list() {
+        let app = App::new(day(), vec![], vec![]);
+        let titles: Vec<String> = day_sections(&app)
+            .iter()
+            .map(|(section, _)| section.title(&app))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![format!("Tasker — {}", day().format("%a %b %d, %Y"))],
+            "an empty viewed day still draws its section"
+        );
+    }
+
+    #[test]
+    fn day_sections_narrow_together_under_a_tag_filter() {
+        let mut app = App::new(
+            day(),
+            vec![
+                tagged_task(1, "work today", &["work"]),
+                tagged_task(2, "admin today", &["admin"]),
+            ],
+            vec![tagged_task(9, "work overdue", &["work"])],
+        );
+        app.set_missed_due(vec![
+            tagged_task(7, "work missed", &["work"]),
+            tagged_task(6, "admin missed", &["admin"]),
+        ]);
+        app.set_due_today(vec![tagged_task(8, "work due", &["work"])]);
+        app.set_all_tags(vec!["work".to_string(), "admin".to_string()]);
+        app.update(Message::CycleTagFilter); // -> "#work"
+
+        let sections = day_sections(&app);
+        assert_eq!(sections.len(), 4, "each section still holds a #work row");
+        for (section, rows) in &sections {
+            assert!(
+                rows.iter()
+                    .all(|task| task.tags.iter().any(|tag| tag == "work")),
+                "{section:?} narrows with every other section"
+            );
+        }
     }
 }

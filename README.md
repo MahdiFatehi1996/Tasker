@@ -2,7 +2,7 @@
 
 # Tasker
 
-**A single-binary, offline, keyboard-driven daily task manager for the terminal — with an amber-phosphor retro theme and a scriptable CLI.**
+**A single-binary, offline, keyboard-driven daily task manager for the terminal — with a VS Code Dark Modern theme and a scriptable CLI.**
 
 [![Verify & Release](https://github.com/MahdiFatehi1996/Tasker/actions/workflows/release.yml/badge.svg)](https://github.com/MahdiFatehi1996/Tasker/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -61,7 +61,7 @@ export. Written in Rust, with `unsafe` code forbidden at the crate level.
 - **Detail editor** — title, priority (low/medium/high), due moment, tags, and free-text multiline notes, all in-app.
 - **CLI companion** — `add` / `done` / `list` / `export` share the storage layer for capture without the TUI.
 - **Export** — one-way JSON (full fidelity) and readable markdown; no data lock-in.
-- **Amber-phosphor theme** — a single palette applied across every widget.
+- **VS Code Dark Modern theme** — a single palette applied across every widget.
 - **Local-first storage** — embedded SQLite, no setup beyond launching.
 
 ## 📦 Install
@@ -159,7 +159,7 @@ Tagged releases publish prebuilt binaries for Windows, Linux, and macOS on the
 
 - **`[` / `]`** — previous / next day. The list reloads for the viewed day.
 - **`t`** — snap back to today.
-- **Calendar jumping** — press `Tab` to focus the calendar (bright amber border), move the cursor
+- **Calendar jumping** — press `Tab` to focus the calendar (blue accent border), move the cursor
   with arrows or `hjkl` (`↑`/`↓` step a week), press `Enter` to jump the viewed day to the cursor,
   `Esc` to return focus to the list.
 - **Add to any day** — navigate somewhere else and press `a`; the new task is pinned to the viewed
@@ -200,8 +200,12 @@ print usage and exit non-zero.
 | Database    | `%APPDATA%\tasker\tasks.db` (override: `--db`, `TASKER_DB`)                        |
 | Single task | id, day (`YYYY-MM-DD`), title, done, priority, notes, due, tracked seconds, tags   |
 | Schema      | Created on first launch; a version marker drives migrations (v1 → v2 adds due, tags, tracked seconds) |
+| Side-cars   | `tasks.db-wal` and `tasks.db-shm`: the write-ahead log; present alongside the database, copy them with it |
 
-Back up by copying the `.db` file.
+Back up by copying all three database files together: `tasks.db`, plus `tasks.db-wal` and
+`tasks.db-shm` when they exist. Tasker uses write-ahead logging, so the newest commits can live
+in those side-car files, and copying `tasks.db` alone can silently miss them. For a single
+self-contained snapshot, use `sqlite3 tasks.db "VACUUM INTO 'tasks-backup.db'"` instead.
 
 ## 🧱 Project layout
 
@@ -212,7 +216,7 @@ src/
   app.rs     Pure state machine (messages → state + effects), unit-tested
   db.rs      SQLite storage seam (day queries, overdue, due, tags, timer)
   model.rs   Domain types + formatting (tags, due input, H:MM totals)
-  theme.rs   Single amber-phosphor palette
+  theme.rs   Single VS Code Dark Modern palette
   ui.rs      Ratatui render + event loop + keymap
 ```
 

@@ -9,6 +9,7 @@
 //! [`Database::open`] migrates v1 databases idempotently.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
@@ -114,6 +115,22 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute_batch(SCHEMA_TAGS)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Milliseconds a connection waits for a lock held by another connection
+/// before returning `SQLITE_BUSY`.
+const BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// Storage-seam concurrency configuration shared by every connection, so the
+/// TUI and the CLI inherit it with no surface-specific code: wait briefly for a
+/// lock another connection holds, and commit through a write-ahead log so reads
+/// stay served while a write is in flight.
+fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+    // `journal_mode` persists on the file; in-memory databases report "memory"
+    // and simply ignore the request.
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
     Ok(())
 }
 
@@ -224,6 +241,7 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        configure_connection(&conn)?;
         enable_foreign_keys(&conn)?;
         init_schema(&conn)?;
         Ok(Database { conn })
@@ -234,6 +252,7 @@ impl Database {
     #[allow(dead_code)]
     pub fn open_in_memory() -> Result<Database, Error> {
         let conn = Connection::open_in_memory()?;
+        configure_connection(&conn)?;
         enable_foreign_keys(&conn)?;
         init_schema(&conn)?;
         Ok(Database { conn })
@@ -1132,6 +1151,115 @@ mod tests {
         drop(db);
 
         std::fs::remove_file(&path).expect("remove temp db");
+    }
+
+    /// Remove a file database and its write-ahead-log side-cars.
+    fn remove_db_files(path: &Path) {
+        let mut side_cars = Vec::new();
+        for suffix in ["-wal", "-shm"] {
+            let mut side_car = path.as_os_str().to_owned();
+            side_car.push(suffix);
+            side_cars.push(PathBuf::from(side_car));
+        }
+        let _ = std::fs::remove_file(path);
+        for side_car in side_cars {
+            let _ = std::fs::remove_file(side_car);
+        }
+    }
+
+    #[test]
+    fn file_database_uses_write_ahead_logging() {
+        let path = temp_db_path();
+        let db = Database::open(&path).expect("open file database");
+        drop(db);
+
+        // WAL is a persistent property of the file: a later connection sees it
+        // and recent commits live in the `-wal` side-car rather than the `.db`.
+        let conn = rusqlite::Connection::open(&path).expect("open raw connection");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read journal mode");
+        drop(conn);
+        remove_db_files(&path);
+
+        assert_eq!(mode, "wal", "the storage seam enables write-ahead logging");
+    }
+
+    #[test]
+    fn concurrent_write_waits_for_a_held_lock_then_succeeds() {
+        let path = temp_db_path();
+        let day = test_day();
+        let writer = Database::open(&path).expect("open writer database");
+        writer.save_task(&sample_task()).expect("seed a task");
+
+        // A second connection (another surface) takes the write lock.
+        let holder = rusqlite::Connection::open(&path).expect("open holder connection");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("acquire the write lock");
+        holder
+            .execute(
+                "INSERT INTO tasks (day, title, done, priority, notes, tracked_secs) VALUES ('2026-10-10', 'held', 0, 'medium', '', 0)",
+                [],
+            )
+            .expect("stage a row under the lock");
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            holder.execute_batch("COMMIT").expect("release the lock");
+        });
+
+        let started = std::time::Instant::now();
+        writer
+            .save_task(&sample_task())
+            .expect("a write waits for the held lock instead of failing immediately");
+        let waited = started.elapsed();
+        release.join().expect("release thread joins");
+
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "the write waited for the lock to clear (waited {waited:?})"
+        );
+        assert_eq!(
+            writer.tasks_for_day(day).expect("count tasks").len(),
+            3,
+            "the seed, the held, and the waited-on write all landed"
+        );
+        drop(writer);
+        remove_db_files(&path);
+    }
+
+    #[test]
+    fn read_is_served_while_a_write_transaction_is_in_flight() {
+        let path = temp_db_path();
+        let day = test_day();
+        // Two Database connections to the same file, then another surface takes
+        // the database exclusively. Write-ahead logging keeps the reader available.
+        let writer = Database::open(&path).expect("open writer database");
+        let reader = Database::open(&path).expect("open reader database");
+
+        let holder = rusqlite::Connection::open(&path).expect("open holder connection");
+        holder
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("take the database exclusively");
+        holder
+            .execute(
+                "INSERT INTO tasks (day, title, done, priority, notes, tracked_secs) VALUES ('2026-10-10', 'uncommitted', 0, 'medium', '', 0)",
+                [],
+            )
+            .expect("stage an uncommitted row");
+
+        let tasks = reader
+            .tasks_for_day(day)
+            .expect("a read is served while a write is in flight");
+        assert!(tasks.is_empty(), "the reader never sees uncommitted writes");
+
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("release the write lock");
+        drop(holder);
+        drop((reader, writer));
+        remove_db_files(&path);
     }
 
     #[test]
