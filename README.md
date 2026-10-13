@@ -52,7 +52,7 @@ forbidden at the crate level.
 └──────────────────────┘
 
                             ⚠ Missed due
-                            j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · / search · [ ] day · t today · Tab cal · ? help · q quit
+v0.3.1                      j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · / search · [ ] day · t today · Tab cal · ? help · q quit
 ```
 
 ## ✨ Features

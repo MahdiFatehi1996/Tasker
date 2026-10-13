@@ -529,7 +529,8 @@ fn summary_panel(
 
 /// Draw one frame: calendar pane left, day-list column right
 /// (Missed-due and Due-today sections when non-empty, Overdue section
-/// when non-empty, viewed day, status footer).
+/// when non-empty, viewed day, status footer). The left column ends with the
+/// version stamp in the bottom-left corner.
 fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
     // Paint the whole frame in the palette first, so any cell no widget
     // covers still sits on the dark backdrop.
@@ -541,12 +542,14 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
         .constraints([Constraint::Length(calendar.width() + 2), Constraint::Min(1)])
         .split(frame.area());
 
-    // The left column stacks the Calendar above the always-visible Summary.
+    // The left column stacks the Calendar above the always-visible Summary,
+    // with the version stamped in the bottom-left corner beneath it.
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(calendar.height() + 2),
             Constraint::Min(1),
+            Constraint::Length(1),
         ])
         .split(outer[0]);
 
@@ -572,6 +575,13 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
     // once. A derived section with no rows is omitted.
     let sections = day_sections(app);
     frame.render_widget(summary_panel(app, &sections, now), left[1]);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            theme::dim(),
+        )),
+        left[2],
+    );
 
     let mut constraints: Vec<Constraint> = sections
         .iter()
@@ -1411,6 +1421,21 @@ mod tests {
         assert!(
             text.contains("Done: 0/1"),
             "the figures narrow with the filter"
+        );
+    }
+
+    #[test]
+    fn frame_stamps_the_version_in_the_bottom_left_corner() {
+        let text = buffer_text(&render_frame(&smoke_app(), noon()));
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            text.contains(&version),
+            "the version is stamped in the frame:\n{text}"
+        );
+        let bottom_left = text.lines().last().expect("at least one rendered row");
+        assert!(
+            bottom_left.starts_with(&version),
+            "the version anchors the bottom-left corner:\n{bottom_left:?}"
         );
     }
 
