@@ -56,10 +56,11 @@ export. Written in Rust, with `unsafe` code forbidden at the crate level.
 - **Automatic carry-over** — overdue tasks surface in today's view flagged with their original day; completing one clears it.
 - **Due moments** — set an exact due date-time; **Due today** and **Missed due** sections surface hard commitments, and a launch toast flags anything already past due.
 - **Tags & filter** — attach multiple tags per task and cycle a one-tag filter to focus the whole list.
+- **Cross-day Search** — press `/` to find tasks by title or notes across every day; results group by day, the Summary mirrors them, and each result can be toggled, edited, deleted, or timed like a Day-list row.
 - **Live timer** — start/stop one task at a time with `w`; totals (`H:MM`) show on rows and in the editor, and survive restarts.
 - **Calendar pane** — month grid with a keyboard cursor for jumping to any day.
 - **Detail editor** — title, priority (low/medium/high), due moment, tags, and free-text multiline notes, all in-app.
-- **CLI companion** — `add` / `done` / `list` / `show` / `tags` / `stats` / `export` share the storage layer for capture and inspection without the TUI, with optional `--json` for scripts.
+- **CLI companion** — `add` / `done` / `list` / `search` / `show` / `tags` / `stats` / `export` share the storage layer for capture and inspection without the TUI, with optional `--json` for scripts.
 - **Export** — one-way JSON (full fidelity) and readable markdown; no data lock-in.
 - **VS Code Dark Modern theme** — a single palette applied across every widget.
 - **Local-first storage** — embedded SQLite, no setup beyond launching.
@@ -191,6 +192,7 @@ tasker update 3 --title "Buy oat milk"               # change one field, leaving
 tasker update 3 --due ""                             # a blank --due clears the deadline
 tasker rm 4                                          # delete task 4
 tasker list                                          # print today's view (sections + rows)
+tasker search rent                                   # find tasks by title or notes across all days
 tasker list --json                                   # the four sections as an envelope
 tasker show 3                                        # print one task's detail
 tasker show 3 --json                                 # that task as a bare JSON object
@@ -205,9 +207,9 @@ tasker capabilities --json                           # report the contract + sch
 `--notes` are all optional, and an invalid `--due` or `--priority` is a usage error rather than a
 silent default. `add` and `update` titles may begin with dashes after a `--` terminator.
 `update` changes only the fields you pass and leaves every other field untouched, so a concurrent
-edit is not clobbered. Writes print a one-line confirmation by default; `list` mirrors the TUI's
-Missed-due / Due-today / Overdue / Today sections; `export` writes to stdout so you can pipe it
-anywhere.
+edit is not clobbered. Writes (`add`, `done`, `reopen`, `update`, `rm`) print a one-line
+confirmation by default; `list` mirrors the TUI's Missed-due / Due-today / Overdue / Today
+sections; `search` groups matches by day; `export` writes to stdout so you can pipe it anywhere.
 
 Every command has a machine-readable form behind `--json`, with human text unchanged and the
 default. **Collections** (`list`, `tags`, `capabilities`) are wrapped in an envelope carrying the

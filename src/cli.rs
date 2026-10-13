@@ -179,6 +179,12 @@ pub enum Command {
         /// Emit the machine-readable envelope instead of human text.
         json: bool,
     },
+    /// Print tasks whose title or notes match `query`, across every day.
+    /// Human-readable only; `--json` arrives with a later ticket.
+    Search {
+        /// The search query (trimmed; must be non-blank).
+        query: String,
+    },
     /// Print one task by id: human detail by default, or the bare task
     /// object under `--json` (never an envelope).
     Show {
@@ -231,6 +237,7 @@ tasker update <id> [--json]                change only the given fields
                 [--tags \"a, b\"] [--notes \"...\"]
 tasker rm <id> [--json]                    delete a task
 tasker list [--json]                       print today's view
+tasker search \"query\"                      find tasks by title or notes
 tasker show <id> [--json]                  print one task
 tasker tags [--json]                       list the tags in use
 tasker stats [--json]                      print the day's figures
@@ -286,6 +293,14 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
         }
         Some("list") => {
             parse_json_flag("list", &positional[1..]).map(|json| Command::List { json })
+        }
+        Some("search") => {
+            let query = positional[1..].join(" ").trim().to_string();
+            if query.is_empty() {
+                Err(CommandError::usage("search needs a query"))
+            } else {
+                Ok(Command::Search { query })
+            }
         }
         Some("show") => parse_show(&positional[1..]),
         Some("tags") => {
@@ -637,6 +652,7 @@ pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> 
         Command::Reopen { id, json } => reopen(db, id, json),
         Command::Remove { id, json } => remove(db, id, json),
         Command::List { json } => list(db, json),
+        Command::Search { query } => search(db, &query),
         Command::Show { id, json } => show(db, id, json),
         Command::Tags { json } => tags(db, json),
         Command::Stats { json } => stats(db, json),
@@ -932,6 +948,31 @@ fn list_line(task: &Task) -> String {
     line
 }
 
+/// Cross-day search as readable text, one heading per day so a Task's Day
+/// list is legible without knowing it beforehand. No matches is its own
+/// message, distinct from an empty day.
+fn search(db: &Database, query: &str) -> Result<String, CommandError> {
+    let tasks = db.search_tasks(query).map_err(storage)?;
+    if tasks.is_empty() {
+        return Ok(format!("No matches for \"{query}\"."));
+    }
+    let mut out = String::new();
+    let mut day: Option<NaiveDate> = None;
+    for task in &tasks {
+        if day != Some(task.day) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&task.day.format("%Y-%m-%d").to_string());
+            out.push('\n');
+            day = Some(task.day);
+        }
+        out.push_str(&list_line(task));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Commands the current contract version exposes, reported by `capabilities`.
 const COMMANDS: &[&str] = &[
     "add",
@@ -941,6 +982,7 @@ const COMMANDS: &[&str] = &[
     "list",
     "reopen",
     "rm",
+    "search",
     "show",
     "stats",
     "tags",
@@ -2066,6 +2108,77 @@ mod tests {
             execute(&db, Command::List { json: false }).expect("list"),
             "No tasks today."
         );
+    }
+
+    #[test]
+    fn search_collects_and_trims_the_query() {
+        assert_eq!(
+            parse_args(&args(&["search", "pay", "rent"])),
+            Ok((
+                None,
+                Command::Search {
+                    query: "pay rent".to_string()
+                }
+            ))
+        );
+        assert!(parse_args(&args(&["search"])).is_err());
+        assert!(parse_args(&args(&["search", "   "])).is_err());
+    }
+
+    #[test]
+    fn search_prints_matching_tasks_grouped_by_day() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        db.save_task(&NewTask {
+            day: earlier,
+            title: "Pay the Rent".to_string(),
+            priority: Priority::Medium,
+            notes: String::new(),
+            due: None,
+            tags: Vec::new(),
+        })
+        .expect("save title match");
+        db.save_task(&NewTask {
+            day: day(),
+            title: "Groceries".to_string(),
+            priority: Priority::Medium,
+            notes: "remember the rent".to_string(),
+            due: None,
+            tags: Vec::new(),
+        })
+        .expect("save notes match");
+
+        let output = execute(
+            &db,
+            Command::Search {
+                query: "RENT".to_string(),
+            },
+        )
+        .expect("search");
+
+        assert!(output.contains("Pay the Rent"), "{output}");
+        assert!(output.contains("Groceries"), "{output}");
+        assert!(
+            output.contains("2026-10-08"),
+            "earlier day heading:\n{output}"
+        );
+        assert!(
+            output.contains("2026-10-10"),
+            "later day heading:\n{output}"
+        );
+    }
+
+    #[test]
+    fn search_with_no_match_says_so() {
+        let db = seeded_db();
+        let output = execute(
+            &db,
+            Command::Search {
+                query: "zzz".to_string(),
+            },
+        )
+        .expect("search");
+        assert!(output.contains("No matches"), "{output}");
     }
 
     #[test]

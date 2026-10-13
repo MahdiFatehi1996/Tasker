@@ -259,8 +259,14 @@ fn tags_flag(task: &Task) -> Option<String> {
     }
 }
 
-/// Flag rendering an overdue task's day pin; every overdue row carries one.
+/// Flag rendering a task's day pin; every overdue row carries one.
 fn overdue_flag(task: &Task) -> Option<String> {
+    Some(day_flag(task))
+}
+
+/// Flag rendering a Search result's day pin, so a cross-day result names the
+/// day it belongs to.
+fn search_flag(task: &Task) -> Option<String> {
     Some(day_flag(task))
 }
 
@@ -278,12 +284,23 @@ fn section_block(title: &str, title_style: Style) -> Block<'static> {
 /// One section of the day-list column. The variants, in [`SECTIONS`], are the
 /// single source of the render: order, titles, styles, and the per-row flag
 /// rule all live here, and every section is drawn by the same loop.
+///
+/// Search extends the same list rather than adding a parallel render path:
+/// while Search is active, [`day_sections`] yields one [`Section::SearchDay`]
+/// per day that has a result (or a single [`Section::SearchEmpty`] when
+/// nothing matched), so the rows, the Summary, and the footer all read the
+/// same source and cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
     MissedDue,
     DueToday,
     Overdue,
     Today,
+    /// One day's group of Search results.
+    SearchDay(NaiveDate),
+    /// The Search screen with no matching rows: kept so "no results" reads
+    /// differently from an empty Day list.
+    SearchEmpty,
 }
 
 /// Sections in render order, most urgent first.
@@ -295,42 +312,62 @@ const SECTIONS: [Section; 4] = [
 ];
 
 impl Section {
-    /// Bordered frame title; the viewed Day list names its date.
+    /// Bordered frame title; the viewed Day list names its date, and each
+    /// Search group names the day it holds.
     fn title(self, app: &App) -> String {
         match self {
             Section::MissedDue => "Missed Due".to_string(),
             Section::DueToday => "Due Today".to_string(),
             Section::Overdue => "Overdue".to_string(),
             Section::Today => format!("Tasker — {}", app.viewed().format("%a %b %d, %Y")),
+            Section::SearchDay(day) => format!("Search — {}", day.format("%a %b %d, %Y")),
+            Section::SearchEmpty => {
+                let query = app.search_query().trim();
+                if query.is_empty() {
+                    "Search — type to find tasks".to_string()
+                } else {
+                    format!("Search — \"{query}\" (no results)")
+                }
+            }
         }
     }
 
-    /// Title style: Missed due keeps the error colour, the rest take the
-    /// accent so the day-list headings read as one family.
+    /// Title style: Missed due keeps the error colour, an empty Search warns,
+    /// the rest take the accent so the headings read as one family.
     fn title_style(self) -> Style {
         match self {
             Section::MissedDue => theme::alert(),
+            Section::SearchEmpty => theme::warning(),
             _ => theme::accent(),
         }
     }
 
     /// The flag drawn after a row's checkbox: the due moment in the due
-    /// sections, the day pin when overdue, the tags on the viewed day.
+    /// sections, the day pin when overdue or in Search, the tags on the
+    /// viewed day.
     fn flag(self) -> fn(&Task) -> Option<String> {
         match self {
             Section::MissedDue | Section::DueToday => due_flag,
             Section::Overdue => overdue_flag,
             Section::Today => tags_flag,
+            Section::SearchDay(_) | Section::SearchEmpty => search_flag,
         }
     }
 
-    /// Visible rows under the active tag filter.
+    /// Visible rows under the active tag filter (Search rows are unfiltered).
     fn rows(self, app: &App) -> Vec<Task> {
         match self {
             Section::MissedDue => app.visible_missed_due(),
             Section::DueToday => app.visible_due_today(),
             Section::Overdue => app.visible_overdue(),
             Section::Today => app.visible_tasks(),
+            Section::SearchDay(day) => app
+                .search_results()
+                .iter()
+                .filter(|task| task.day == day)
+                .cloned()
+                .collect(),
+            Section::SearchEmpty => Vec::new(),
         }
     }
 
@@ -341,34 +378,66 @@ impl Section {
             Section::DueToday => app.due_today_cursor(),
             Section::Overdue => app.overdue_cursor(),
             Section::Today => app.today_cursor(),
+            Section::SearchDay(day) => app.search_cursor_in(day),
+            Section::SearchEmpty => None,
         }
     }
 
     /// Whether the section is dropped when it has no rows. The derived
-    /// sections are omitted when empty; the viewed Day list always shows.
+    /// sections and empty Search day groups are omitted; the viewed Day list
+    /// and the explicit empty-Search screen always show.
     fn omitted_when_empty(self) -> bool {
-        self != Section::Today
+        !matches!(self, Section::Today | Section::SearchEmpty)
     }
 
     /// Height in the vertical split: a derived section sizes to its rows;
-    /// the viewed Day list takes the remainder.
+    /// the viewed Day list and the empty-Search screen take the remainder.
     fn constraint(self, rows: usize) -> Constraint {
         match self {
-            Section::Today => Constraint::Min(1),
+            Section::Today | Section::SearchEmpty => Constraint::Min(1),
             _ => Constraint::Length(rows as u16 + 2),
         }
+    }
+
+    /// Whether the section's rows are "the day" for the Summary's Done
+    /// fraction: the viewed Day list, or any Search day group. This keeps the
+    /// Summary derived from the same sections the column draws.
+    fn is_primary(self) -> bool {
+        matches!(self, Section::Today | Section::SearchDay(_))
     }
 }
 
 /// The sections to render this frame, in order, each paired with its visible
-/// rows: the one source the day-list column draws from. An empty derived
-/// section is dropped; the viewed Day list always remains.
+/// rows: the one source the day-list column and the Summary both draw from.
+/// While Search is active the sections are the day groups of the results (or
+/// the explicit empty-Search screen); otherwise an empty derived section is
+/// dropped and the viewed Day list always remains.
 fn day_sections(app: &App) -> Vec<(Section, Vec<Task>)> {
+    if app.mode() == Mode::Search {
+        return search_sections(app);
+    }
     SECTIONS
         .into_iter()
         .map(|section| (section, section.rows(app)))
         .filter(|(section, rows)| !(rows.is_empty() && section.omitted_when_empty()))
         .collect()
+}
+
+/// Search results grouped by day, in day order (the order the storage query
+/// returns). A result set with no rows still yields one [`Section::SearchEmpty`]
+/// so an empty search is never mistaken for an empty Day list.
+fn search_sections(app: &App) -> Vec<(Section, Vec<Task>)> {
+    let mut groups: Vec<(Section, Vec<Task>)> = Vec::new();
+    for task in app.search_results() {
+        match groups.last_mut() {
+            Some((Section::SearchDay(day), rows)) if *day == task.day => rows.push(task.clone()),
+            _ => groups.push((Section::SearchDay(task.day), vec![task.clone()])),
+        }
+    }
+    if groups.is_empty() {
+        groups.push((Section::SearchEmpty, Vec::new()));
+    }
+    groups
 }
 
 /// One Summary figure: a dim label and a strong value.
@@ -389,22 +458,24 @@ fn section_count(sections: &[(Section, Vec<Task>)], wanted: Section) -> usize {
 }
 
 /// The Summary block: a read-out of the sections rendered beside it. Every
+/// The Summary block: a read-out of the sections rendered beside it. Every
 /// figure derives from `sections` — the single [`day_sections`] list the
 /// day-list column draws from — so the Summary can never disagree with the
-/// rows on screen. The title names the active tag filter, whose narrowing is
-/// already reflected in those rows; the tracked total sums the live display
-/// of every rendered row, so a running Timer's segment is included.
+/// rows on screen. The Done fraction counts the primary sections (the viewed
+/// Day list, or Search's day groups), so it mirrors whichever view is active;
+/// the tracked total sums the live display of every rendered row, so a running
+/// Timer's segment is included. The title names the active scope.
 fn summary_panel(
     app: &App,
     sections: &[(Section, Vec<Task>)],
     now: NaiveDateTime,
 ) -> Paragraph<'static> {
-    let today_rows = sections
+    let primary = sections
         .iter()
-        .find(|(section, _)| *section == Section::Today)
-        .map_or(&[][..], |(_, rows)| rows.as_slice());
-    let done = today_rows.iter().filter(|task| task.done).count();
-    let total = today_rows.len();
+        .filter(|(section, _)| section.is_primary())
+        .flat_map(|(_, rows)| rows.iter());
+    let done = primary.clone().filter(|task| task.done).count();
+    let total = primary.count();
     let tracked: i64 = sections
         .iter()
         .flat_map(|(_, rows)| rows.iter())
@@ -416,9 +487,12 @@ fn summary_panel(
         .filter(|task| !task.done && task.priority == Priority::High)
         .count();
 
-    let title = match app.tag_filter() {
-        Some(tag) => format!("Summary — #{tag}"),
-        None => "Summary".to_string(),
+    let title = match app.mode() {
+        Mode::Search => format!("Summary — search: {}", app.search_query().trim()),
+        _ => match app.tag_filter() {
+            Some(tag) => format!("Summary — #{tag}"),
+            None => "Summary".to_string(),
+        },
     };
     let lines = vec![
         summary_line(
@@ -561,7 +635,7 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
             (
                 Line::from(status),
                 Line::styled(
-                    "j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · [ ] day · t today · Tab cal · ? help · q quit",
+                    "j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · / search · [ ] day · t today · Tab cal · ? help · q quit",
                     theme::dim(),
                 ),
             )
@@ -570,6 +644,33 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
             Line::styled("Enter commit/newline · Ctrl+S save", theme::strong()),
             Line::styled("Tab field · ←/→ priority · Esc cancel", theme::dim()),
         ),
+        Mode::Search if app.search_editing() => (
+            Line::from(vec![
+                Span::styled("Search: ", theme::strong()),
+                Span::styled(app.search_query().to_string(), theme::caret()),
+                Span::styled("▌", theme::caret()),
+            ]),
+            Line::styled(
+                "type to narrow · Enter results · Esc day list",
+                theme::dim(),
+            ),
+        ),
+        Mode::Search => {
+            let mut status: Vec<Span> = vec![Span::styled(
+                format!("Search: {}", app.search_query()),
+                theme::strong(),
+            )];
+            if app.search_results().is_empty() {
+                status.push(Span::styled(" — no matches", theme::warning()));
+            }
+            (
+                Line::from(status),
+                Line::styled(
+                    "j/k move · x toggle · d del · u undo · e edit · w timer · / edit query · Esc day list · ? help · q quit",
+                    theme::dim(),
+                ),
+            )
+        }
     };
     frame.render_widget(
         Paragraph::new(vec![status, help]).style(theme::text()),
@@ -621,8 +722,16 @@ fn help_text() -> Vec<Line<'static>> {
         Line::raw("  w             start/stop timer (one at a time)"),
         Line::raw("  f             cycle tag filter"),
         Line::raw("  Esc           clear tag filter"),
+        Line::raw("  /             search titles and notes across all days"),
         Line::raw("  Tab           focus calendar"),
         Line::raw("  q             quit"),
+        Line::raw(""),
+        Line::raw("Search (/)  — a cross-day view, not the Day list"),
+        Line::raw("  type, Backspace  narrow the results live"),
+        Line::raw("  Enter            navigate and act on the results"),
+        Line::raw("  Esc              back to the Day list (clears the query)"),
+        Line::raw("  j/k, x, d, u, e, w  act exactly as in the Day list"),
+        Line::raw("  /                edit the query again"),
         Line::raw(""),
         Line::raw("Days"),
         Line::raw("  [ / ]         previous / next day"),
@@ -652,11 +761,13 @@ fn help_text() -> Vec<Line<'static>> {
 
 /// Pure key-to-message mapping; unmapped keys yield None (ignored).
 /// `now` carries the wall clock into time-stamped messages (`t`, `w`, `q`) so
-/// state stays pure.
+/// state stays pure. `search_editing` distinguishes Search's query-entry phase
+/// from its result-navigation phase, so Action keys never clash with typing.
 fn map_key(
     key: KeyEvent,
     mode: Mode,
     calendar_focused: bool,
+    search_editing: bool,
     now: NaiveDateTime,
 ) -> Option<Message> {
     match mode {
@@ -683,6 +794,27 @@ fn map_key(
             KeyCode::Char(c) => Some(Message::EditChar(c)),
             _ => None,
         },
+        Mode::Search if search_editing => match key.code {
+            KeyCode::Esc => Some(Message::ExitSearch),
+            KeyCode::Enter => Some(Message::SearchSubmit),
+            KeyCode::Backspace => Some(Message::SearchBackspace),
+            KeyCode::Char(c) => Some(Message::SearchChar(c)),
+            _ => None,
+        },
+        Mode::Search => match key.code {
+            KeyCode::Char('q') => Some(Message::Quit(now)),
+            KeyCode::Char('?') => Some(Message::ToggleHelp),
+            KeyCode::Char('/') => Some(Message::RefocusSearch),
+            KeyCode::Char('j') | KeyCode::Down => Some(Message::SearchSelectNext),
+            KeyCode::Char('k') | KeyCode::Up => Some(Message::SearchSelectPrev),
+            KeyCode::Char('x') | KeyCode::Char(' ') => Some(Message::ToggleSelected),
+            KeyCode::Char('d') => Some(Message::DeleteSelected),
+            KeyCode::Char('u') => Some(Message::UndoDelete),
+            KeyCode::Char('e') | KeyCode::Enter => Some(Message::BeginEdit),
+            KeyCode::Char('w') => Some(Message::ToggleTimer(now)),
+            KeyCode::Esc => Some(Message::ExitSearch),
+            _ => None,
+        },
         Mode::Browse => match key.code {
             // Global day keys work regardless of calendar focus.
             KeyCode::Char('[') => Some(Message::ViewPrevDay),
@@ -690,6 +822,7 @@ fn map_key(
             KeyCode::Char('t') => Some(Message::ViewToday(now.date())),
             KeyCode::Char('q') => Some(Message::Quit(now)),
             KeyCode::Char('?') => Some(Message::ToggleHelp),
+            KeyCode::Char('/') => Some(Message::BeginSearch),
             _ if calendar_focused => match key.code {
                 KeyCode::Left | KeyCode::Char('h') => Some(Message::MoveCursor(-1)),
                 KeyCode::Right | KeyCode::Char('l') => Some(Message::MoveCursor(1)),
@@ -721,7 +854,12 @@ fn map_key(
 /// While the help overlay is open the app behind it is frozen: only `?`
 /// and `Esc` get through (closing help); every other key is swallowed so
 /// the overlay can neither act nor be left stale behind.
-fn read_message(mode: Mode, calendar_focused: bool, help_open: bool) -> std::io::Result<Message> {
+fn read_message(
+    mode: Mode,
+    calendar_focused: bool,
+    search_editing: bool,
+    help_open: bool,
+) -> std::io::Result<Message> {
     loop {
         let Event::Key(key) = event::read()? else {
             continue;
@@ -738,7 +876,7 @@ fn read_message(mode: Mode, calendar_focused: bool, help_open: bool) -> std::io:
         // Read the clock after the key so timer starts are stamped at the
         // moment of the press, not when the previous frame was drawn.
         let now = Local::now().naive_local();
-        if let Some(message) = map_key(key, mode, calendar_focused, now) {
+        if let Some(message) = map_key(key, mode, calendar_focused, search_editing, now) {
             return Ok(message);
         }
     }
@@ -772,6 +910,7 @@ fn event_loop(
         let effects = app.update(read_message(
             app.mode(),
             app.calendar_focused(),
+            app.search_editing(),
             app.help_open(),
         )?);
         if !effects.is_empty() {
@@ -808,6 +947,17 @@ fn event_loop(
             // Tag names feed the `f` filter cycle; a filter pointing at a
             // vanished tag clears inside the setter.
             app.set_all_tags(db.all_tags()?);
+            // Search is recomputed from the query on every reload, so its
+            // results always reflect the same store the Day list just read.
+            if app.mode() == Mode::Search {
+                let query = app.search_query().trim().to_string();
+                let results = if query.is_empty() {
+                    Vec::new()
+                } else {
+                    db.search_tasks(&query)?
+                };
+                app.set_search_results(results);
+            }
         }
         if app.should_quit() {
             break;
@@ -837,84 +987,84 @@ mod tests {
     fn browse_list_keys_map() {
         let now = noon();
         assert_eq!(
-            map_key(press(KeyCode::Char('q')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('q')), Mode::Browse, false, false, now),
             Some(Message::Quit(now))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('j')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('j')), Mode::Browse, false, false, now),
             Some(Message::SelectNext)
         );
         assert_eq!(
-            map_key(press(KeyCode::Down), Mode::Browse, false, now),
+            map_key(press(KeyCode::Down), Mode::Browse, false, false, now),
             Some(Message::SelectNext)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('k')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('k')), Mode::Browse, false, false, now),
             Some(Message::SelectPrev)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('x')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('x')), Mode::Browse, false, false, now),
             Some(Message::ToggleSelected)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(' ')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char(' ')), Mode::Browse, false, false, now),
             Some(Message::ToggleSelected)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('d')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('d')), Mode::Browse, false, false, now),
             Some(Message::DeleteSelected),
             "delete is its own key, distinct from the done toggle"
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('u')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('u')), Mode::Browse, false, false, now),
             Some(Message::UndoDelete)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('a')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('a')), Mode::Browse, false, false, now),
             Some(Message::BeginAdd)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('[')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('[')), Mode::Browse, false, false, now),
             Some(Message::ViewPrevDay)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(']')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char(']')), Mode::Browse, false, false, now),
             Some(Message::ViewNextDay)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('t')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('t')), Mode::Browse, false, false, now),
             Some(Message::ViewToday(day()))
         );
         assert_eq!(
-            map_key(press(KeyCode::Tab), Mode::Browse, false, now),
+            map_key(press(KeyCode::Tab), Mode::Browse, false, false, now),
             Some(Message::FocusCalendar)
         );
         assert_eq!(
-            map_key(press(KeyCode::Enter), Mode::Browse, false, now),
+            map_key(press(KeyCode::Enter), Mode::Browse, false, false, now),
             Some(Message::BeginEdit)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('e')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('e')), Mode::Browse, false, false, now),
             Some(Message::BeginEdit)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('w')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('w')), Mode::Browse, false, false, now),
             Some(Message::ToggleTimer(now))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('f')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('f')), Mode::Browse, false, false, now),
             Some(Message::CycleTagFilter)
         );
         assert_eq!(
-            map_key(press(KeyCode::Esc), Mode::Browse, false, now),
+            map_key(press(KeyCode::Esc), Mode::Browse, false, false, now),
             Some(Message::ClearTagFilter)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('?')), Mode::Browse, false, now),
+            map_key(press(KeyCode::Char('?')), Mode::Browse, false, false, now),
             Some(Message::ToggleHelp)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('?')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char('?')), Mode::Browse, true, false, now),
             Some(Message::ToggleHelp),
             "help is reachable while focused"
         );
@@ -924,62 +1074,62 @@ mod tests {
     fn browse_calendar_keys_move_cursor() {
         let now = noon();
         assert_eq!(
-            map_key(press(KeyCode::Left), Mode::Browse, true, now),
+            map_key(press(KeyCode::Left), Mode::Browse, true, false, now),
             Some(Message::MoveCursor(-1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Right), Mode::Browse, true, now),
+            map_key(press(KeyCode::Right), Mode::Browse, true, false, now),
             Some(Message::MoveCursor(1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Up), Mode::Browse, true, now),
+            map_key(press(KeyCode::Up), Mode::Browse, true, false, now),
             Some(Message::MoveCursor(-7))
         );
         assert_eq!(
-            map_key(press(KeyCode::Down), Mode::Browse, true, now),
+            map_key(press(KeyCode::Down), Mode::Browse, true, false, now),
             Some(Message::MoveCursor(7))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('h')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char('h')), Mode::Browse, true, false, now),
             Some(Message::MoveCursor(-1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('l')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char('l')), Mode::Browse, true, false, now),
             Some(Message::MoveCursor(1))
         );
         assert_eq!(
-            map_key(press(KeyCode::Enter), Mode::Browse, true, now),
+            map_key(press(KeyCode::Enter), Mode::Browse, true, false, now),
             Some(Message::JumpToCursor)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(' ')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char(' ')), Mode::Browse, true, false, now),
             Some(Message::JumpToCursor)
         );
         assert_eq!(
-            map_key(press(KeyCode::Esc), Mode::Browse, true, now),
+            map_key(press(KeyCode::Esc), Mode::Browse, true, false, now),
             Some(Message::FocusList)
         );
         assert_eq!(
-            map_key(press(KeyCode::Tab), Mode::Browse, true, now),
+            map_key(press(KeyCode::Tab), Mode::Browse, true, false, now),
             Some(Message::FocusList)
         );
         assert_eq!(
-            map_key(press(KeyCode::Char(']')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char(']')), Mode::Browse, true, false, now),
             Some(Message::ViewNextDay),
             "day-stepping stays global while focused"
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('w')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char('w')), Mode::Browse, true, false, now),
             None,
             "timer is list-scoped, like the other row actions"
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('d')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char('d')), Mode::Browse, true, false, now),
             None,
             "delete is list-scoped too"
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('u')), Mode::Browse, true, now),
+            map_key(press(KeyCode::Char('u')), Mode::Browse, true, false, now),
             None,
             "undo is list-scoped too"
         );
@@ -989,33 +1139,36 @@ mod tests {
     fn adding_keys_edit_or_commit() {
         let now = noon();
         assert_eq!(
-            map_key(press(KeyCode::Char('b')), Mode::Adding, false, now),
+            map_key(press(KeyCode::Char('b')), Mode::Adding, false, false, now),
             Some(Message::AddChar('b'))
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('[')), Mode::Adding, false, now),
+            map_key(press(KeyCode::Char('[')), Mode::Adding, false, false, now),
             Some(Message::AddChar('[')),
             "brackets type while adding"
         );
         assert_eq!(
-            map_key(press(KeyCode::Enter), Mode::Adding, false, now),
+            map_key(press(KeyCode::Enter), Mode::Adding, false, false, now),
             Some(Message::CommitAdd)
         );
         assert_eq!(
-            map_key(press(KeyCode::Esc), Mode::Adding, false, now),
+            map_key(press(KeyCode::Esc), Mode::Adding, false, false, now),
             Some(Message::CancelAdd)
         );
         assert_eq!(
-            map_key(press(KeyCode::Backspace), Mode::Adding, false, now),
+            map_key(press(KeyCode::Backspace), Mode::Adding, false, false, now),
             Some(Message::AddBackspace)
         );
-        assert_eq!(map_key(press(KeyCode::Tab), Mode::Adding, false, now), None);
+        assert_eq!(
+            map_key(press(KeyCode::Tab), Mode::Adding, false, false, now),
+            None
+        );
     }
 
     #[test]
     fn detail_keys_edit() {
         let now = noon();
-        let detail = |code| map_key(press(code), Mode::Detail, false, now);
+        let detail = |code| map_key(press(code), Mode::Detail, false, false, now);
         assert_eq!(detail(KeyCode::Enter), Some(Message::PressEnter));
         assert_eq!(detail(KeyCode::Esc), Some(Message::CancelEdit));
         assert_eq!(detail(KeyCode::Tab), Some(Message::NextField));
@@ -1033,6 +1186,7 @@ mod tests {
             map_key(
                 KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
                 Mode::Detail,
+                false,
                 false,
                 now
             ),
@@ -1365,5 +1519,167 @@ mod tests {
                 "{section:?} narrows with every other section"
             );
         }
+    }
+
+    #[test]
+    fn search_keys_map() {
+        let now = noon();
+        assert_eq!(
+            map_key(press(KeyCode::Char('/')), Mode::Browse, false, false, now),
+            Some(Message::BeginSearch)
+        );
+        // Query-entry phase: characters type, Esc leaves.
+        assert_eq!(
+            map_key(press(KeyCode::Char('r')), Mode::Search, false, true, now),
+            Some(Message::SearchChar('r'))
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Backspace), Mode::Search, false, true, now),
+            Some(Message::SearchBackspace)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Enter), Mode::Search, false, true, now),
+            Some(Message::SearchSubmit)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Esc), Mode::Search, false, true, now),
+            Some(Message::ExitSearch)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('q')), Mode::Search, false, true, now),
+            Some(Message::SearchChar('q')),
+            "q is typed while entering the query, not read as quit"
+        );
+        // Result-navigation phase: the Day-list actions apply to the results.
+        assert_eq!(
+            map_key(press(KeyCode::Char('j')), Mode::Search, false, false, now),
+            Some(Message::SearchSelectNext)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('k')), Mode::Search, false, false, now),
+            Some(Message::SearchSelectPrev)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('x')), Mode::Search, false, false, now),
+            Some(Message::ToggleSelected)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('d')), Mode::Search, false, false, now),
+            Some(Message::DeleteSelected)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('u')), Mode::Search, false, false, now),
+            Some(Message::UndoDelete)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('e')), Mode::Search, false, false, now),
+            Some(Message::BeginEdit)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('w')), Mode::Search, false, false, now),
+            Some(Message::ToggleTimer(now))
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('/')), Mode::Search, false, false, now),
+            Some(Message::RefocusSearch)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Esc), Mode::Search, false, false, now),
+            Some(Message::ExitSearch)
+        );
+    }
+
+    /// A Search-mode app whose results span two days: two on `earlier`, one
+    /// on `later`, each carrying a distinct title.
+    fn search_frame_app() -> App {
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        let later = NaiveDate::from_ymd_opt(2026, 10, 12).expect("valid date");
+        let mut first = task(9, "old note task");
+        first.day = earlier;
+        let mut second = task(8, "another old task");
+        second.day = earlier;
+        let mut third = task(5, "rent receipt");
+        third.day = later;
+
+        let mut app = App::new(day(), vec![], vec![]);
+        app.update(Message::BeginSearch);
+        app.update(Message::SearchChar('r'));
+        app.set_search_results(vec![first, second, third]);
+        app
+    }
+
+    #[test]
+    fn headless_search_frame_groups_results_by_day_with_day_flags() {
+        let text = buffer_text(&render_frame(&search_frame_app(), noon()));
+
+        assert!(
+            text.contains("Search — "),
+            "each group is titled by its day"
+        );
+        assert!(text.contains("old note task"), "results are drawn");
+        assert!(text.contains("2026-10-08"), "a row names its day");
+        assert!(text.contains("2026-10-12"), "another day's rows too");
+    }
+
+    #[test]
+    fn headless_search_with_no_results_is_not_an_empty_day_list() {
+        let mut app = App::new(day(), vec![task(1, "today")], vec![]);
+        app.update(Message::BeginSearch);
+        app.update(Message::SearchChar('z'));
+
+        let text = buffer_text(&render_frame(&app, noon()));
+        assert!(
+            text.contains("no results"),
+            "an empty search says so:\n{text}"
+        );
+
+        let empty = buffer_text(&render_frame(&App::new(day(), vec![], vec![]), noon()));
+        assert!(
+            empty.contains("Tasker — "),
+            "an empty Day list keeps its date heading"
+        );
+        assert!(
+            !empty.contains("no results"),
+            "the two empty screens are distinguishable"
+        );
+    }
+
+    #[test]
+    fn summary_mirrors_the_search_results() {
+        let mut app = App::new(day(), vec![], vec![]);
+        app.update(Message::BeginSearch);
+        app.update(Message::SearchChar('r'));
+        let mut done = task(1, "done hit");
+        done.done = true;
+        done.tracked_secs = 60;
+        let mut open = task(2, "open hit");
+        open.tracked_secs = 120;
+        app.set_search_results(vec![done, open]);
+
+        let text = buffer_text(&render_frame(&app, noon()));
+        assert!(
+            text.contains("Summary — search: r"),
+            "the title names the scope"
+        );
+        assert!(
+            text.contains("Done: 1/2"),
+            "the fraction mirrors the results"
+        );
+        assert!(text.contains("Tracked: 0:03"), "tracked sums the results");
+    }
+
+    #[test]
+    fn headless_help_overlay_documents_search() {
+        let mut app = smoke_app();
+        app.update(crate::app::Message::ToggleHelp);
+        let text = buffer_text(&render_frame(&app, noon()));
+        assert!(
+            text.contains("search titles and notes across all days"),
+            "help documents `/`:\n{text}"
+        );
+        assert!(
+            text.contains("back to the Day list"),
+            "help documents Esc leaving Search:\n{text}"
+        );
     }
 }
