@@ -199,6 +199,12 @@ fn sync_tags(conn: &Connection, task_id: i64, tags: &[String]) -> rusqlite::Resu
         )?;
     }
     // Prune orphan tags so the table never accumulates dead names.
+    prune_orphan_tags(conn)
+}
+
+/// Drop tag names no task references, so the filter never offers a tag that
+/// matches nothing.
+fn prune_orphan_tags(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM task_tags)",
         [],
@@ -288,6 +294,39 @@ impl Database {
                 due_text,
                 task.tracked_secs.max(0),
                 task.id,
+            ),
+        )?;
+        sync_tags(&self.conn, task.id, &task.tags)?;
+        Ok(())
+    }
+
+    /// Delete a task by id, dropping its tag links (foreign-key cascade) and
+    /// pruning tags left without a carrier. Returns `true` when a task was
+    /// removed, `false` for an unknown id.
+    pub fn delete_task(&self, id: i64) -> Result<bool, Error> {
+        let removed = self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+        if removed > 0 {
+            prune_orphan_tags(&self.conn)?;
+        }
+        Ok(removed > 0)
+    }
+
+    /// Re-insert a previously deleted task exactly as it was: same id, day,
+    /// state, priority, notes, due moment, tracked seconds, and tags. Backs
+    /// in-session undo.
+    pub fn restore_task(&self, task: &Task) -> Result<(), Error> {
+        let due_text = task.due.as_ref().map(format_due);
+        self.conn.execute(
+            "INSERT INTO tasks (id, day, title, done, priority, notes, due, tracked_secs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                task.id,
+                task.day.format(DAY_FORMAT).to_string(),
+                &task.title,
+                task.done as i64,
+                task.priority.as_str(),
+                &task.notes,
+                due_text,
+                task.tracked_secs.max(0),
             ),
         )?;
         sync_tags(&self.conn, task.id, &task.tags)?;
@@ -415,10 +454,7 @@ impl Database {
                 "DELETE FROM task_tags WHERE task_id = ?1 AND tag_id = ?2",
                 rusqlite::params![task_id, tag_id],
             )?;
-            self.conn.execute(
-                "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM task_tags)",
-                [],
-            )?;
+            prune_orphan_tags(&self.conn)?;
         }
         Ok(())
     }
@@ -1096,6 +1132,116 @@ mod tests {
         drop(db);
 
         std::fs::remove_file(&path).expect("remove temp db");
+    }
+
+    #[test]
+    fn delete_task_removes_the_task() {
+        let db = memory_db();
+        let id = db.save_task(&sample_task()).expect("save task");
+        assert!(db.task_by_id(id).expect("load").is_some());
+
+        assert!(db.delete_task(id).expect("delete task"), "reports removal");
+
+        assert!(db.task_by_id(id).expect("load").is_none());
+        assert!(db.tasks_for_day(test_day()).expect("query day").is_empty());
+    }
+
+    #[test]
+    fn delete_of_missing_task_reports_not_deleted() {
+        let db = memory_db();
+        assert!(
+            !db.delete_task(404).expect("delete missing task"),
+            "unknown id deletes nothing"
+        );
+    }
+
+    #[test]
+    fn deleting_a_task_prunes_tags_no_other_task_uses() {
+        let db = memory_db();
+        let id = db
+            .save_task(&NewTask {
+                day: test_day(),
+                title: "Disposable".to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+                due: None,
+                tags: vec!["work".to_string(), "admin".to_string()],
+            })
+            .expect("save task");
+        assert_eq!(
+            db.all_tags().expect("tags"),
+            vec!["admin".to_string(), "work".to_string()]
+        );
+
+        db.delete_task(id).expect("delete task");
+
+        assert!(
+            db.all_tags().expect("tags").is_empty(),
+            "deleting the last carrier drops its orphan tags"
+        );
+    }
+
+    #[test]
+    fn deleting_a_task_keeps_tags_still_used_elsewhere() {
+        let db = memory_db();
+        let doomed = db
+            .save_task(&NewTask {
+                day: test_day(),
+                title: "Disposable".to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+                due: None,
+                tags: vec!["work".to_string(), "admin".to_string()],
+            })
+            .expect("save doomed");
+        let survivor = db
+            .save_task(&NewTask {
+                day: test_day(),
+                title: "Keep me".to_string(),
+                priority: Priority::Medium,
+                notes: String::new(),
+                due: None,
+                tags: vec!["work".to_string()],
+            })
+            .expect("save survivor");
+
+        db.delete_task(doomed).expect("delete task");
+
+        assert_eq!(
+            db.all_tags().expect("tags"),
+            vec!["work".to_string()],
+            "shared tag survives; only the orphan is pruned"
+        );
+        assert_eq!(
+            db.task_by_id(survivor).expect("load").expect("exists").tags,
+            vec!["work".to_string()]
+        );
+    }
+
+    #[test]
+    fn restore_task_returns_every_field() {
+        let db = memory_db();
+        let due = test_noon();
+        let id = db
+            .save_task(&NewTask {
+                day: test_day(),
+                title: "Quarterly report".to_string(),
+                priority: Priority::High,
+                notes: "Include the chart.".to_string(),
+                due: Some(due),
+                tags: vec!["work".to_string()],
+            })
+            .expect("save task");
+        db.add_tracked_secs(id, 123).expect("bank seconds");
+        let original = db.task_by_id(id).expect("load").expect("exists");
+
+        db.delete_task(id).expect("delete task");
+        db.restore_task(&original).expect("restore task");
+
+        let restored = db.task_by_id(id).expect("load").expect("restored");
+        assert_eq!(restored, original, "every field returns, including the id");
+        assert_eq!(db.tasks_for_day(test_day()).expect("query day").len(), 1);
+        assert_eq!(db.all_tags().expect("tags"), vec!["work".to_string()]);
     }
 
     #[test]

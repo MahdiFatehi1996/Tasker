@@ -453,7 +453,7 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
             (
                 Line::styled(status, status_style),
                 Line::styled(
-                    "j/k move · x toggle · a add · e edit · w timer · f filter · [ ] day · t today · Tab cal · ? help · q quit",
+                    "j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · [ ] day · t today · Tab cal · ? help · q quit",
                     theme::dim(),
                 ),
             )
@@ -506,6 +506,8 @@ fn help_text() -> Vec<Line<'static>> {
         Line::raw("Day list"),
         Line::raw("  j/k, arrows   move selection"),
         Line::raw("  x, Space      toggle done"),
+        Line::raw("  d             delete task (undo with u)"),
+        Line::raw("  u             undo last delete"),
         Line::raw("  a             add task"),
         Line::raw("  e, Enter      edit task"),
         Line::raw("  w             start/stop timer (one at a time)"),
@@ -593,6 +595,8 @@ fn map_key(
                 KeyCode::Char('j') | KeyCode::Down => Some(Message::SelectNext),
                 KeyCode::Char('k') | KeyCode::Up => Some(Message::SelectPrev),
                 KeyCode::Char('x') | KeyCode::Char(' ') => Some(Message::ToggleSelected),
+                KeyCode::Char('d') => Some(Message::DeleteSelected),
+                KeyCode::Char('u') => Some(Message::UndoDelete),
                 KeyCode::Char('a') => Some(Message::BeginAdd),
                 KeyCode::Char('e') | KeyCode::Enter => Some(Message::BeginEdit),
                 KeyCode::Char('w') => Some(Message::ToggleTimer(now)),
@@ -677,6 +681,12 @@ fn event_loop(
                     } => {
                         db.add_tracked_secs(task_id, delta_secs)?;
                     }
+                    Effect::Delete { task_id } => {
+                        db.delete_task(task_id)?;
+                    }
+                    Effect::Restore(task) => {
+                        db.restore_task(&task)?;
+                    }
                     Effect::Reload => {}
                 }
             }
@@ -741,6 +751,15 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Char(' ')), Mode::Browse, false, now),
             Some(Message::ToggleSelected)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('d')), Mode::Browse, false, now),
+            Some(Message::DeleteSelected),
+            "delete is its own key, distinct from the done toggle"
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('u')), Mode::Browse, false, now),
+            Some(Message::UndoDelete)
         );
         assert_eq!(
             map_key(press(KeyCode::Char('a')), Mode::Browse, false, now),
@@ -845,6 +864,16 @@ mod tests {
             map_key(press(KeyCode::Char('w')), Mode::Browse, true, now),
             None,
             "timer is list-scoped, like the other row actions"
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('d')), Mode::Browse, true, now),
+            None,
+            "delete is list-scoped too"
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('u')), Mode::Browse, true, now),
+            None,
+            "undo is list-scoped too"
         );
     }
 
@@ -1011,5 +1040,20 @@ mod tests {
         app.update(crate::app::Message::BeginEdit);
         let text = buffer_text(&render_frame(&app, noon()));
         assert!(text.contains("Tracked:"), "editor pane shows timer");
+    }
+
+    #[test]
+    fn headless_help_overlay_documents_delete_and_undo() {
+        let mut app = smoke_app();
+        app.update(crate::app::Message::ToggleHelp);
+        let text = buffer_text(&render_frame(&app, noon()));
+        assert!(
+            text.contains("delete task"),
+            "help documents delete:\n{text}"
+        );
+        assert!(
+            text.contains("undo last delete"),
+            "help documents undo:\n{text}"
+        );
     }
 }

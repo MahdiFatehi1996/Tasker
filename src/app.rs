@@ -77,6 +77,15 @@ enum Section {
     Today,
 }
 
+/// Single-level, in-memory undo buffer: the most recently deleted task and
+/// the section it came from, so a restore puts it back where it was. Replaced
+/// on the next delete, dropped when the session ends. Never persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UndoEntry {
+    task: Task,
+    section: Section,
+}
+
 /// In-progress edit of one task: drafts plus the snapshot they came from
 /// (id, day, and done state carry over untouched on commit).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +200,12 @@ pub enum Message {
     SelectNext,
     SelectPrev,
     ToggleSelected,
+    /// Delete the selected task (`d`); the removed task is held for undo.
+    /// A no-op with nothing selected.
+    DeleteSelected,
+    /// Restore the most recently deleted task (`u`). A no-op with nothing
+    /// to restore — never an error.
+    UndoDelete,
     BeginAdd,
     AddChar(char),
     AddBackspace,
@@ -247,6 +262,12 @@ pub enum Effect {
         task_id: i64,
         delta_secs: i64,
     },
+    /// Delete a task by id.
+    Delete {
+        task_id: i64,
+    },
+    /// Re-insert a previously deleted task exactly as it was (undo).
+    Restore(Task),
     /// Reload the viewed day's list from storage (after navigation).
     Reload,
 }
@@ -272,6 +293,7 @@ pub struct App {
     draft: String,
     editor: Option<EditorState>,
     running: Option<RunningTimer>,
+    undo: Option<UndoEntry>,
     calendar_focused: bool,
     cursor: NaiveDate,
     help_open: bool,
@@ -298,6 +320,7 @@ impl App {
             draft: String::new(),
             editor: None,
             running: None,
+            undo: None,
             calendar_focused: false,
             help_open: false,
             should_quit: false,
@@ -331,6 +354,16 @@ impl App {
             Section::DueToday => &self.due_today,
             Section::Overdue => &self.overdue,
             Section::Today => &self.tasks,
+        }
+    }
+
+    /// Mutable raw rows of one section (delete/restore).
+    fn section_tasks_mut(&mut self, section: Section) -> &mut Vec<Task> {
+        match section {
+            Section::MissedDue => &mut self.missed_due,
+            Section::DueToday => &mut self.due_today,
+            Section::Overdue => &mut self.overdue,
+            Section::Today => &mut self.tasks,
         }
     }
 
@@ -673,6 +706,26 @@ impl App {
                 Some(task) => {
                     task.toggle();
                     vec![Effect::Update(task.clone())]
+                }
+                None => vec![],
+            },
+            Message::DeleteSelected => {
+                let Some(task) = self.selected_task().cloned() else {
+                    return vec![];
+                };
+                let (section, _) = self.split_index(self.selected);
+                let task_id = task.id;
+                self.section_tasks_mut(section).retain(|t| t.id != task_id);
+                self.undo = Some(UndoEntry { task, section });
+                self.clamp_selection();
+                vec![Effect::Delete { task_id }]
+            }
+            Message::UndoDelete => match self.undo.take() {
+                Some(entry) => {
+                    self.section_tasks_mut(entry.section)
+                        .push(entry.task.clone());
+                    self.clamp_selection();
+                    vec![Effect::Restore(entry.task)]
                 }
                 None => vec![],
             },
@@ -1039,6 +1092,89 @@ mod tests {
     fn toggle_on_empty_list_emits_nothing() {
         let mut app = App::new(day(), vec![], vec![]);
         assert_eq!(app.update(Message::ToggleSelected), vec![]);
+    }
+
+    #[test]
+    fn delete_removes_the_selected_task_and_emits_delete() {
+        let mut app = three_tasks();
+        app.update(Message::SelectNext);
+        assert_eq!(app.selected_task().map(|t| t.title.as_str()), Some("two"));
+
+        let effects = app.update(Message::DeleteSelected);
+
+        assert_eq!(effects, vec![Effect::Delete { task_id: 2 }]);
+        assert_eq!(app.visible_tasks().len(), 2);
+        assert!(
+            app.visible_tasks().iter().all(|t| t.id != 2),
+            "deleted task leaves the list immediately"
+        );
+        assert_eq!(
+            app.selected_task().map(|t| t.title.as_str()),
+            Some("three"),
+            "selection stays on a valid row"
+        );
+    }
+
+    #[test]
+    fn delete_on_empty_list_emits_nothing() {
+        let mut app = App::new(day(), vec![], vec![]);
+        assert_eq!(app.update(Message::DeleteSelected), vec![]);
+    }
+
+    #[test]
+    fn undo_restores_the_deleted_task_with_every_field() {
+        let mut original = tagged_task(2, "two", &["work"]);
+        original.due = Some(noon());
+        original.notes = "the body".to_string();
+        original.tracked_secs = 90;
+        let mut app = App::new(day(), vec![task(1, "one"), original.clone()], vec![]);
+        app.update(Message::SelectNext);
+        app.update(Message::DeleteSelected);
+
+        let effects = app.update(Message::UndoDelete);
+
+        assert_eq!(effects, vec![Effect::Restore(original.clone())]);
+        assert!(
+            app.visible_tasks().contains(&original),
+            "restored task is back in the list with its fields intact"
+        );
+    }
+
+    #[test]
+    fn undo_with_nothing_to_restore_is_a_noop() {
+        let mut app = three_tasks();
+        assert_eq!(app.update(Message::UndoDelete), vec![]);
+    }
+
+    #[test]
+    fn a_second_delete_replaces_the_undo_buffer() {
+        let mut app = three_tasks();
+        app.update(Message::DeleteSelected);
+        app.update(Message::DeleteSelected);
+
+        let effects = app.update(Message::UndoDelete);
+
+        assert_eq!(
+            effects,
+            vec![Effect::Restore(task(2, "two"))],
+            "undo holds only the most recent delete"
+        );
+        assert!(
+            app.visible_tasks().iter().all(|t| t.id != 1),
+            "the first delete is not resurrected"
+        );
+    }
+
+    #[test]
+    fn undo_restores_into_the_section_it_came_from() {
+        let mut app = with_overdue();
+        app.update(Message::DeleteSelected);
+        assert!(app.visible_overdue().is_empty());
+
+        app.update(Message::UndoDelete);
+
+        assert_eq!(app.visible_overdue().len(), 1);
+        assert_eq!(app.visible_overdue()[0].title, "old unfinished");
     }
 
     #[test]
