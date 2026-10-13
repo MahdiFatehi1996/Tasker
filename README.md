@@ -59,7 +59,7 @@ export. Written in Rust, with `unsafe` code forbidden at the crate level.
 - **Live timer** — start/stop one task at a time with `w`; totals (`H:MM`) show on rows and in the editor, and survive restarts.
 - **Calendar pane** — month grid with a keyboard cursor for jumping to any day.
 - **Detail editor** — title, priority (low/medium/high), due moment, tags, and free-text multiline notes, all in-app.
-- **CLI companion** — `add` / `done` / `list` / `export` share the storage layer for capture without the TUI.
+- **CLI companion** — `add` / `done` / `list` / `show` / `tags` / `stats` / `export` share the storage layer for capture and inspection without the TUI, with optional `--json` for scripts.
 - **Export** — one-way JSON (full fidelity) and readable markdown; no data lock-in.
 - **VS Code Dark Modern theme** — a single palette applied across every widget.
 - **Local-first storage** — embedded SQLite, no setup beyond launching.
@@ -186,6 +186,11 @@ tasker add "Buy milk"                                # add a task to today
 tasker done 3                                        # mark task 3 done
 tasker rm 4                                          # delete task 4
 tasker list                                          # print today's view (sections + rows)
+tasker list --json                                   # the four sections as an envelope
+tasker show 3                                        # print one task's detail
+tasker show 3 --json                                 # that task as a bare JSON object
+tasker tags --json                                   # every tag in use, as an envelope
+tasker stats --json                                  # the day's aggregate figures
 tasker export --format json                          # full-fidelity dump: every field
 tasker export --format markdown --day 2026-10-08     # readable log of one day
 tasker capabilities --json                           # report the contract + schema versions
@@ -193,8 +198,31 @@ tasker capabilities --json                           # report the contract + sch
 
 `add` / `done` / `rm` print a one-line confirmation; `list` mirrors the TUI's Missed-due /
 Due-today / Overdue / Today sections; `export` writes to stdout so you can pipe it anywhere.
-`capabilities` reports the Agent interface contract version and the storage schema version —
-human text by default, `--json` for the machine-readable envelope.
+
+Every read command has a machine-readable form behind `--json`, with human text unchanged
+and the default. **Collections** (`list`, `tags`, `capabilities`) are wrapped in an envelope
+carrying the contract and schema versions around a `payload`; **`show` is the exception** — a
+single Task is a bare JSON object, not an envelope:
+
+```json
+{
+  "contract": 1,
+  "schema": 2,
+  "payload": {
+    "missed_due": [],
+    "due_today": [],
+    "overdue": [],
+    "today": []
+  }
+}
+```
+
+The nine Task field names — `id`, `day`, `title`, `done`, `priority`, `notes`, `due`,
+`tracked_secs`, `tags` — are frozen. `tracked_secs` is named after its unit, and `due` is a
+naive local date-time with no offset. `stats` reports `tracked_secs` as **stored** seconds
+only: the live running-timer segment is in-memory TUI state that does not exist on the CLI.
+`tasker export --format json` stays a bare top-level array (the legacy whole-database dump),
+not an envelope.
 
 Exit codes are part of the contract. A missing task and a storage failure are now distinct, so a
 caller can decide whether to correct its input or give up:

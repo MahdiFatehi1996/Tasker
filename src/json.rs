@@ -122,6 +122,74 @@ impl JsonWriter {
     }
 }
 
+/// A flat JSON object whose members are pre-rendered: numbers, escaped
+/// strings, or arrays of [`Task`]. The section payload behind `list --json`
+/// and the aggregate figures behind `stats --json` are the two callers; the
+/// legacy export stays a bare array written by [`JsonWriter::collection`].
+#[derive(Debug, Default)]
+pub(crate) struct JsonObject {
+    members: Vec<(String, String)>,
+}
+
+impl JsonObject {
+    /// Start an empty object.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a numeric member.
+    pub(crate) fn number(&mut self, name: &str, value: i64) -> &mut Self {
+        self.members.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Add a string member (escaped including its quotes).
+    pub(crate) fn text(&mut self, name: &str, value: &str) -> &mut Self {
+        self.members.push((name.to_string(), string(value)));
+        self
+    }
+
+    /// Add an array-of-objects member: `name` maps to `tasks`, each rendered
+    /// as a task object and indented under the member. An empty slice stays
+    /// `[]` so a caller still sees every key.
+    pub(crate) fn tasks(&mut self, name: &str, tasks: &[Task]) -> &mut Self {
+        self.members.push((name.to_string(), task_array(tasks)));
+        self
+    }
+
+    /// Render the object, one member per line.
+    pub(crate) fn finish(&self) -> String {
+        if self.members.is_empty() {
+            return "{}".to_string();
+        }
+        let body = self
+            .members
+            .iter()
+            .map(|(name, value)| format!("  {}: {value}", string(name)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("{{\n{body}\n}}")
+    }
+}
+
+/// Render `tasks` as an array nested inside an object member: the brackets sit
+/// at two spaces, each task at four. Empty input is the inline `[]`.
+fn task_array(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return "[]".to_string();
+    }
+    let items = tasks
+        .iter()
+        .map(|task| {
+            let mut writer = JsonWriter::new();
+            writer.task(task, 4);
+            writer.finish()
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("[\n{items}\n  ]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +237,48 @@ mod tests {
   "tags": []
 }"#;
         assert_eq!(writer.finish(), expected);
+    }
+
+    #[test]
+    fn renders_an_object_with_number_string_and_task_members() {
+        let mut object = JsonObject::new();
+        object
+            .text("day", "2026-10-10")
+            .number("total", 1)
+            .tasks("today", &[task()]);
+        let expected = r#"{
+  "day": "2026-10-10",
+  "total": 1,
+  "today": [
+    {
+      "id": 7,
+      "day": "2026-10-10",
+      "title": "Solo",
+      "done": true,
+      "priority": "low",
+      "notes": "",
+      "due": null,
+      "tracked_secs": 0,
+      "tags": []
+    }
+  ]
+}"#;
+        assert_eq!(object.finish(), expected);
+    }
+
+    #[test]
+    fn empty_task_member_is_an_inline_array() {
+        let mut object = JsonObject::new();
+        object.tasks("overdue", &[]);
+        assert_eq!(
+            object.finish(),
+            "{\n  \"overdue\": []\n}",
+            "an empty section still carries its key"
+        );
+    }
+
+    #[test]
+    fn empty_object_renders_as_empty_braces() {
+        assert_eq!(JsonObject::new().finish(), "{}");
     }
 }
