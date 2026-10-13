@@ -180,10 +180,13 @@ pub enum Command {
         json: bool,
     },
     /// Print tasks whose title or notes match `query`, across every day.
-    /// Human-readable only; `--json` arrives with a later ticket.
+    /// Human-readable by default; `--json` groups the matches by day inside
+    /// the Agent interface envelope.
     Search {
         /// The search query (trimmed; must be non-blank).
         query: String,
+        /// Emit the machine-readable envelope instead of human text.
+        json: bool,
     },
     /// Print one task by id: human detail by default, or the bare task
     /// object under `--json` (never an envelope).
@@ -237,7 +240,7 @@ tasker update <id> [--json]                change only the given fields
                 [--tags \"a, b\"] [--notes \"...\"]
 tasker rm <id> [--json]                    delete a task
 tasker list [--json]                       print today's view
-tasker search \"query\"                      find tasks by title or notes
+tasker search \"query\" [--json]             find tasks by title or notes
 tasker show <id> [--json]                  print one task
 tasker tags [--json]                       list the tags in use
 tasker stats [--json]                      print the day's figures
@@ -245,7 +248,7 @@ tasker export --format json|markdown       dump all tasks or log a day
                 [--day YYYY-MM-DD]         (markdown: day to log)
 tasker capabilities [--json]               report contract and schema versions
 exit codes: 0 success, 2 usage, 3 not found, 4 storage
-a title may begin with dashes after a `--` terminator";
+a title or query may begin with dashes after a `--` terminator";
 
 /// Parse the process argument list (including `argv[0]`) into an optional
 /// explicit database path and a command. Extracts `--db <path>` /
@@ -294,14 +297,7 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
         Some("list") => {
             parse_json_flag("list", &positional[1..]).map(|json| Command::List { json })
         }
-        Some("search") => {
-            let query = positional[1..].join(" ").trim().to_string();
-            if query.is_empty() {
-                Err(CommandError::usage("search needs a query"))
-            } else {
-                Ok(Command::Search { query })
-            }
-        }
+        Some("search") => parse_search(&positional[1..]),
         Some("show") => parse_show(&positional[1..]),
         Some("tags") => {
             parse_json_flag("tags", &positional[1..]).map(|json| Command::Tags { json })
@@ -386,6 +382,38 @@ fn parse_add(rest: &[String]) -> Result<Command, CommandError> {
         notes,
         json,
     })
+}
+
+/// Parse `search <query> [--json]`. Like `add`, recognised flags are pulled
+/// out of the argument vector *before* the remainder is joined into the query,
+/// so `search pay rent --json` searches for `pay rent` rather than the literal
+/// `pay rent --json`. A `--` terminator sends everything after it into the
+/// query verbatim, so a query may begin with dashes (`search -- --json`
+/// searches for the text `--json`). A query that is blank after trimming is a
+/// usage error, with or without `--json`.
+fn parse_search(rest: &[String]) -> Result<Command, CommandError> {
+    let mut json = false;
+    let mut query_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "--" {
+            query_parts.extend(rest[i + 1..].iter().cloned());
+            break;
+        } else if arg == "--json" {
+            json = true;
+            i += 1;
+        } else {
+            query_parts.push(arg.clone());
+            i += 1;
+        }
+    }
+    let query = query_parts.join(" ").trim().to_string();
+    if query.is_empty() {
+        Err(CommandError::usage("search needs a query"))
+    } else {
+        Ok(Command::Search { query, json })
+    }
 }
 
 /// Parse `update <id>`: exactly one numeric id plus at least one of
@@ -652,7 +680,7 @@ pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> 
         Command::Reopen { id, json } => reopen(db, id, json),
         Command::Remove { id, json } => remove(db, id, json),
         Command::List { json } => list(db, json),
-        Command::Search { query } => search(db, &query),
+        Command::Search { query, json } => search(db, &query, json),
         Command::Show { id, json } => show(db, id, json),
         Command::Tags { json } => tags(db, json),
         Command::Stats { json } => stats(db, json),
@@ -948,29 +976,65 @@ fn list_line(task: &Task) -> String {
     line
 }
 
-/// Cross-day search as readable text, one heading per day so a Task's Day
-/// list is legible without knowing it beforehand. No matches is its own
-/// message, distinct from an empty day.
-fn search(db: &Database, query: &str) -> Result<String, CommandError> {
+/// Cross-day search, grouped by day so a Task's Day list is legible without
+/// knowing it beforehand. Human text is the default, one heading per day; no
+/// matches is its own message, distinct from an empty day. Under `--json` the
+/// matches are grouped the same way inside the Agent envelope, with the query
+/// echoed and an explicit `days` array so an empty result stays parseable and
+/// distinct from the usage error a blank query raises.
+fn search(db: &Database, query: &str, json: bool) -> Result<String, CommandError> {
     let tasks = db.search_tasks(query).map_err(storage)?;
-    if tasks.is_empty() {
+    let groups = group_by_day(tasks);
+
+    if json {
+        let rendered: Vec<String> = groups
+            .iter()
+            .map(|(day, tasks)| {
+                let mut group = JsonObject::new();
+                group
+                    .text("day", &day.format("%Y-%m-%d").to_string())
+                    .tasks("tasks", tasks);
+                group.finish()
+            })
+            .collect();
+        let mut payload = JsonObject::new();
+        payload.text("query", query).objects("days", &rendered);
+        return Ok(envelope(
+            CONTRACT_VERSION,
+            SCHEMA_VERSION,
+            &payload.finish(),
+        ));
+    }
+
+    if groups.is_empty() {
         return Ok(format!("No matches for \"{query}\"."));
     }
     let mut out = String::new();
-    let mut day: Option<NaiveDate> = None;
-    for task in &tasks {
-        if day != Some(task.day) {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&task.day.format("%Y-%m-%d").to_string());
+    for (day, tasks) in &groups {
+        if !out.is_empty() {
             out.push('\n');
-            day = Some(task.day);
         }
-        out.push_str(&list_line(task));
+        out.push_str(&day.format("%Y-%m-%d").to_string());
         out.push('\n');
+        for task in tasks {
+            out.push_str(&list_line(task));
+            out.push('\n');
+        }
     }
     Ok(out)
+}
+
+/// Group results by day, preserving the storage query's day order (ascending
+/// day, then id) — the same grouping the interface's Search screen renders.
+fn group_by_day(tasks: Vec<Task>) -> Vec<(NaiveDate, Vec<Task>)> {
+    let mut groups: Vec<(NaiveDate, Vec<Task>)> = Vec::new();
+    for task in tasks {
+        match groups.last_mut() {
+            Some((day, rows)) if *day == task.day => rows.push(task),
+            _ => groups.push((task.day, vec![task])),
+        }
+    }
+    groups
 }
 
 /// Commands the current contract version exposes, reported by `capabilities`.
@@ -2117,12 +2181,58 @@ mod tests {
             Ok((
                 None,
                 Command::Search {
-                    query: "pay rent".to_string()
+                    query: "pay rent".to_string(),
+                    json: false,
                 }
             ))
         );
         assert!(parse_args(&args(&["search"])).is_err());
         assert!(parse_args(&args(&["search", "   "])).is_err());
+    }
+
+    #[test]
+    fn search_takes_a_trailing_json_flag_and_a_dash_terminator() {
+        assert_eq!(
+            parse_args(&args(&["search", "pay", "rent", "--json"])),
+            Ok((
+                None,
+                Command::Search {
+                    query: "pay rent".to_string(),
+                    json: true,
+                }
+            )),
+            "a trailing --json selects machine output and is not part of the query"
+        );
+        assert_eq!(
+            parse_args(&args(&["search", "--", "--json"])),
+            Ok((
+                None,
+                Command::Search {
+                    query: "--json".to_string(),
+                    json: false,
+                }
+            )),
+            "after `--` the query is the literal text --json"
+        );
+        assert_eq!(
+            parse_args(&args(&["search", "--json", "--", "--json"])),
+            Ok((
+                None,
+                Command::Search {
+                    query: "--json".to_string(),
+                    json: true,
+                }
+            )),
+            "the terminator composes with a real --json flag"
+        );
+        assert!(
+            parse_args(&args(&["search", "--json"])).is_err(),
+            "a blank query is a usage error even with --json"
+        );
+        assert!(
+            parse_args(&args(&["search", "--"])).is_err(),
+            "a blank query after the terminator is still a usage error"
+        );
     }
 
     #[test]
@@ -2152,6 +2262,7 @@ mod tests {
             &db,
             Command::Search {
                 query: "RENT".to_string(),
+                json: false,
             },
         )
         .expect("search");
@@ -2166,6 +2277,101 @@ mod tests {
             output.contains("2026-10-10"),
             "later day heading:\n{output}"
         );
+        assert_eq!(
+            output, "2026-10-08\n  [ ] (M) Pay the Rent\n\n2026-10-10\n  [ ] (M) Groceries\n",
+            "human-readable search output is unchanged"
+        );
+    }
+
+    #[test]
+    fn search_json_groups_matches_by_day_inside_the_envelope() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 8).expect("valid date");
+        db.save_task(&NewTask {
+            day: earlier,
+            title: "Pay the Rent".to_string(),
+            priority: Priority::Medium,
+            notes: String::new(),
+            due: None,
+            tags: Vec::new(),
+        })
+        .expect("save title match");
+        db.save_task(&NewTask {
+            day: day(),
+            title: "Groceries".to_string(),
+            priority: Priority::Medium,
+            notes: "remember the rent".to_string(),
+            due: None,
+            tags: Vec::new(),
+        })
+        .expect("save notes match");
+
+        let json = execute(
+            &db,
+            Command::Search {
+                query: "RENT".to_string(),
+                json: true,
+            },
+        )
+        .expect("search json");
+
+        assert_json_valid(&json);
+        assert!(
+            json.contains(&format!("\"contract\": {CONTRACT_VERSION}")),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!("\"schema\": {}", crate::db::SCHEMA_VERSION)),
+            "{json}"
+        );
+        assert!(json.contains("\"query\": \"RENT\""), "{json}");
+        let earlier_at = json.find("2026-10-08").expect("first day group");
+        let later_at = json.find("2026-10-10").expect("second day group");
+        assert!(
+            earlier_at < later_at,
+            "day groups stay in day order: {json}"
+        );
+        assert!(json.contains("\"tasks\": ["), "{json}");
+        for field in [
+            "id",
+            "day",
+            "title",
+            "done",
+            "priority",
+            "notes",
+            "due",
+            "tracked_secs",
+            "tags",
+        ] {
+            assert!(
+                json.contains(&format!("\"{field}\"")),
+                "frozen task field {field} is present: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_json_with_no_match_is_a_parseable_empty_result() {
+        let db = seeded_db();
+        let outcome = execute(
+            &db,
+            Command::Search {
+                query: "zzz".to_string(),
+                json: true,
+            },
+        );
+        assert_eq!(
+            exit_code(&outcome),
+            0,
+            "an empty result is a valid response, not an error"
+        );
+        let json = outcome.expect("search json");
+        assert_json_valid(&json);
+        assert!(json.contains("\"query\": \"zzz\""), "{json}");
+        assert!(
+            json.contains("\"days\": []"),
+            "an empty result keeps the same shape: {json}"
+        );
     }
 
     #[test]
@@ -2175,6 +2381,7 @@ mod tests {
             &db,
             Command::Search {
                 query: "zzz".to_string(),
+                json: false,
             },
         )
         .expect("search");
