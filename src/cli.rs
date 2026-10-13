@@ -6,13 +6,76 @@
 //! Argument parsing is a pure function ([`parse_args`]) tested without a
 //! process; command execution returns the text to print, keeping stdout in
 //! `main`. A bare `tasker` stays on [`Command::Tui`].
+//!
+//! Failures are typed ([`CommandError`]) and carry exactly one class, so the
+//! process entry point decides the exit code through the pure [`exit_code`]
+//! mapping instead of hard-coding it.
 
 use std::path::PathBuf;
 
 use chrono::{Local, NaiveDate};
 
 use crate::db::Database;
+use crate::json::JsonWriter;
 use crate::model::{NewTask, Task, format_due_input, format_tracked};
+
+/// A command failure, classified so a caller can map it to an exit code.
+/// Exactly one class: usage, not-found, or storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandError {
+    /// The invocation is unusable: bad arguments or unknown options.
+    Usage(String),
+    /// The addressed task does not exist.
+    NotFound(String),
+    /// The storage seam failed.
+    Storage(String),
+}
+
+impl CommandError {
+    /// A usage (argument) failure.
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self::Usage(message.into())
+    }
+
+    /// A missing-task failure.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
+    }
+
+    /// A storage-seam failure.
+    pub fn storage(message: impl Into<String>) -> Self {
+        Self::Storage(message.into())
+    }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandError::Usage(message)
+            | CommandError::NotFound(message)
+            | CommandError::Storage(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+/// Wrap a storage-seam failure as a [`CommandError::Storage`].
+fn storage(error: impl std::fmt::Display) -> CommandError {
+    CommandError::storage(error.to_string())
+}
+
+/// Map a command outcome to its process exit code, preserving the contract
+/// exactly as it stands today: `0` success, `2` a usage (argument) error, and
+/// `1` any other command failure. Distinct codes for not-found and storage
+/// arrive with the Agent interface.
+pub fn exit_code(outcome: &Result<String, CommandError>) -> i32 {
+    match outcome {
+        Ok(_) => 0,
+        Err(CommandError::Usage(_)) => 2,
+        Err(CommandError::NotFound(_) | CommandError::Storage(_)) => 1,
+    }
+}
 
 /// Output format for `tasker export`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +125,7 @@ tasker export --format json|markdown       dump all tasks or log a day
 /// explicit database path and a command. Extracts `--db <path>` /
 /// `--db=<path>` wherever it appears so the two surfaces share one resolution
 /// order.
-pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, Command), String> {
+pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, Command), CommandError> {
     let mut explicit_db = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
@@ -72,7 +135,9 @@ pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, Command), String>
             explicit_db = Some(PathBuf::from(path));
             i += 1;
         } else if arg == "--db" {
-            let value = args.get(i + 1).ok_or("--db needs a path")?;
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| CommandError::usage("--db needs a path"))?;
             explicit_db = Some(PathBuf::from(value));
             i += 2;
         } else {
@@ -83,31 +148,33 @@ pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, Command), String>
     Ok((explicit_db, parse_command(&positional)?))
 }
 
-fn parse_command(positional: &[String]) -> Result<Command, String> {
+fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
     match positional.first().map(String::as_str) {
         None => Ok(Command::Tui),
         Some("add") => {
             let title = positional[1..].join(" ").trim().to_string();
             if title.is_empty() {
-                Err("add needs a title".to_string())
+                Err(CommandError::usage("add needs a title"))
             } else {
                 Ok(Command::Add { title })
             }
         }
         Some("done") => match positional.get(1) {
-            None => Err("done needs a task id".to_string()),
+            None => Err(CommandError::usage("done needs a task id")),
             Some(raw) => raw
                 .parse::<i64>()
                 .map(|id| Command::Done { id })
-                .map_err(|_| format!("done needs a numeric task id, got: {raw}")),
+                .map_err(|_| {
+                    CommandError::usage(format!("done needs a numeric task id, got: {raw}"))
+                }),
         },
         Some("list") => Ok(Command::List),
         Some("export") => parse_export(&positional[1..]),
-        Some(other) => Err(format!("unknown command: {other}")),
+        Some(other) => Err(CommandError::usage(format!("unknown command: {other}"))),
     }
 }
 
-fn parse_export(rest: &[String]) -> Result<Command, String> {
+fn parse_export(rest: &[String]) -> Result<Command, CommandError> {
     let mut format = None;
     let mut day = None;
     let mut i = 0;
@@ -117,42 +184,52 @@ fn parse_export(rest: &[String]) -> Result<Command, String> {
             format = Some(parse_format(value)?);
             i += 1;
         } else if arg == "--format" {
-            let value = rest.get(i + 1).ok_or("--format needs json or markdown")?;
+            let value = rest
+                .get(i + 1)
+                .ok_or_else(|| CommandError::usage("--format needs json or markdown"))?;
             format = Some(parse_format(value)?);
             i += 2;
         } else if let Some(value) = arg.strip_prefix("--day=") {
             day = Some(parse_day(value)?);
             i += 1;
         } else if arg == "--day" {
-            let value = rest.get(i + 1).ok_or("--day needs YYYY-MM-DD")?;
+            let value = rest
+                .get(i + 1)
+                .ok_or_else(|| CommandError::usage("--day needs YYYY-MM-DD"))?;
             day = Some(parse_day(value)?);
             i += 2;
         } else {
-            return Err(format!("unknown export option: {arg}"));
+            return Err(CommandError::usage(format!("unknown export option: {arg}")));
         }
     }
-    let format = format.ok_or("export needs --format json|markdown")?;
+    let format =
+        format.ok_or_else(|| CommandError::usage("export needs --format json|markdown"))?;
     if day.is_some() && format != ExportFormat::Markdown {
-        return Err("--day only applies to --format markdown".to_string());
+        return Err(CommandError::usage(
+            "--day only applies to --format markdown",
+        ));
     }
     Ok(Command::Export { format, day })
 }
 
-fn parse_format(value: &str) -> Result<ExportFormat, String> {
+fn parse_format(value: &str) -> Result<ExportFormat, CommandError> {
     match value {
         "json" => Ok(ExportFormat::Json),
         "markdown" => Ok(ExportFormat::Markdown),
-        other => Err(format!("unknown export format: {other}")),
+        other => Err(CommandError::usage(format!(
+            "unknown export format: {other}"
+        ))),
     }
 }
 
-fn parse_day(value: &str) -> Result<NaiveDate, String> {
-    NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| format!("invalid day: {value}"))
+fn parse_day(value: &str) -> Result<NaiveDate, CommandError> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| CommandError::usage(format!("invalid day: {value}")))
 }
 
 /// Run a command against `db`, returning the text to print. The TUI has no
 /// textual output; the runtime launches it directly instead of calling here.
-pub fn execute(db: &Database, command: Command) -> Result<String, String> {
+pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> {
     match command {
         Command::Tui => Ok(String::new()),
         Command::Add { title } => add(db, &title),
@@ -162,43 +239,34 @@ pub fn execute(db: &Database, command: Command) -> Result<String, String> {
     }
 }
 
-fn add(db: &Database, title: &str) -> Result<String, String> {
+fn add(db: &Database, title: &str) -> Result<String, CommandError> {
     let today = Local::now().date_naive();
     let id = db
         .save_task(&NewTask::dated(today, title.to_string()))
-        .map_err(|e| e.to_string())?;
+        .map_err(storage)?;
     Ok(format!("Added task {id}: {title}"))
 }
 
-fn done(db: &Database, id: i64) -> Result<String, String> {
+fn done(db: &Database, id: i64) -> Result<String, CommandError> {
     let mut task = db
         .task_by_id(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no task with id {id}"))?;
+        .map_err(storage)?
+        .ok_or_else(|| CommandError::not_found(format!("no task with id {id}")))?;
     task.done = true;
-    db.update_task(&task).map_err(|e| e.to_string())?;
+    db.update_task(&task).map_err(storage)?;
     Ok(format!("Done task {id}: {}", task.title))
 }
 
 /// Today's view as plain text: missed-due, due-today, overdue, then the day,
 /// matching the TUI sections. Empty sections are omitted.
-fn list(db: &Database) -> Result<String, String> {
+fn list(db: &Database) -> Result<String, CommandError> {
     let now = Local::now().naive_local();
     let today = now.date();
     let sections = [
-        (
-            "Missed due",
-            db.missed_due_tasks(now).map_err(|e| e.to_string())?,
-        ),
-        (
-            "Due today",
-            db.due_today_tasks(today).map_err(|e| e.to_string())?,
-        ),
-        (
-            "Overdue",
-            db.overdue_tasks(today).map_err(|e| e.to_string())?,
-        ),
-        ("Today", db.tasks_for_day(today).map_err(|e| e.to_string())?),
+        ("Missed due", db.missed_due_tasks(now).map_err(storage)?),
+        ("Due today", db.due_today_tasks(today).map_err(storage)?),
+        ("Overdue", db.overdue_tasks(today).map_err(storage)?),
+        ("Today", db.tasks_for_day(today).map_err(storage)?),
     ];
 
     let mut out = String::new();
@@ -243,53 +311,24 @@ fn list_line(task: &Task) -> String {
     line
 }
 
-fn export(db: &Database, format: ExportFormat, day: Option<NaiveDate>) -> Result<String, String> {
+fn export(
+    db: &Database,
+    format: ExportFormat,
+    day: Option<NaiveDate>,
+) -> Result<String, CommandError> {
     match format {
-        ExportFormat::Json => Ok(tasks_json(&db.all_tasks().map_err(|e| e.to_string())?)),
+        ExportFormat::Json => {
+            let tasks = db.all_tasks().map_err(storage)?;
+            let mut writer = JsonWriter::new();
+            writer.collection(&tasks);
+            Ok(writer.finish())
+        }
         ExportFormat::Markdown => {
             let day = day.unwrap_or_else(|| Local::now().date_naive());
-            let tasks = db.tasks_for_day(day).map_err(|e| e.to_string())?;
+            let tasks = db.tasks_for_day(day).map_err(storage)?;
             Ok(day_markdown(day, &tasks))
         }
     }
-}
-
-/// Full-fidelity JSON array: every field per task, `null` for a missing due
-/// moment, empty array for no tags.
-fn tasks_json(tasks: &[Task]) -> String {
-    let mut out = String::from("[\n");
-    for (i, task) in tasks.iter().enumerate() {
-        let due = match task.due {
-            Some(due) => json_string(&due.format("%Y-%m-%dT%H:%M:%S").to_string()),
-            None => "null".to_string(),
-        };
-        let tags = task
-            .tags
-            .iter()
-            .map(|tag| json_string(tag))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str("  {\n");
-        out.push_str(&format!("    \"id\": {},\n", task.id));
-        out.push_str(&format!(
-            "    \"day\": {},\n",
-            json_string(&task.day.format("%Y-%m-%d").to_string())
-        ));
-        out.push_str(&format!("    \"title\": {},\n", json_string(&task.title)));
-        out.push_str(&format!("    \"done\": {},\n", task.done));
-        out.push_str(&format!(
-            "    \"priority\": {},\n",
-            json_string(task.priority.as_str())
-        ));
-        out.push_str(&format!("    \"notes\": {},\n", json_string(&task.notes)));
-        out.push_str(&format!("    \"due\": {due},\n"));
-        out.push_str(&format!("    \"tracked_secs\": {},\n", task.tracked_secs));
-        out.push_str(&format!("    \"tags\": [{tags}]\n"));
-        let comma = if i + 1 == tasks.len() { "" } else { "," };
-        out.push_str(&format!("  }}{comma}\n"));
-    }
-    out.push(']');
-    out
 }
 
 /// Readable markdown log for one day: heading, then a bullet per task with
@@ -323,25 +362,6 @@ fn day_markdown(day: NaiveDate, tasks: &[Task]) -> String {
             out.push_str(&format!("  {note_line}\n"));
         }
     }
-    out
-}
-
-/// Escape a string as a JSON string literal, including the surrounding quotes.
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }
 
@@ -644,5 +664,69 @@ mod tests {
             execute(&db, Command::List).expect("list"),
             "No tasks today."
         );
+    }
+
+    #[test]
+    fn exit_codes_preserve_todays_contract() {
+        assert_eq!(exit_code(&Ok(String::new())), 0, "success stays 0");
+        assert_eq!(exit_code(&Err(CommandError::usage("bad args"))), 2);
+        assert_eq!(exit_code(&Err(CommandError::not_found("no task"))), 1);
+        assert_eq!(exit_code(&Err(CommandError::storage("disk full"))), 1);
+    }
+
+    #[test]
+    fn argument_errors_carry_the_usage_class() {
+        let error = parse_args(&args(&["done"])).expect_err("missing id");
+        assert!(matches!(error, CommandError::Usage(_)), "{error:?}");
+        let error = parse_args(&args(&["frobnicate"])).expect_err("unknown command");
+        assert!(matches!(error, CommandError::Usage(_)), "{error:?}");
+    }
+
+    #[test]
+    fn missing_task_carries_the_not_found_class() {
+        let db = seeded_db();
+        let error = execute(&db, Command::Done { id: 9999 }).expect_err("no such task");
+        assert!(matches!(error, CommandError::NotFound(_)), "{error:?}");
+    }
+
+    #[test]
+    fn json_export_is_byte_identical() {
+        let db = seeded_db();
+        let json = execute(
+            &db,
+            Command::Export {
+                format: ExportFormat::Json,
+                day: None,
+            },
+        )
+        .expect("export json");
+        let expected = r#"[
+  {
+    "id": 1,
+    "day": "2026-10-10",
+    "title": "Quarterly report",
+    "done": false,
+    "priority": "high",
+    "notes": "line one\nline two",
+    "due": "2026-10-10T09:30:00",
+    "tracked_secs": 90,
+    "tags": ["admin", "work"]
+  }
+]"#;
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn json_export_of_an_empty_database_is_an_empty_array() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let json = execute(
+            &db,
+            Command::Export {
+                format: ExportFormat::Json,
+                day: None,
+            },
+        )
+        .expect("export json");
+        assert_eq!(json, "[\n]");
     }
 }
