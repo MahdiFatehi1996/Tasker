@@ -157,6 +157,25 @@ impl JsonObject {
         self
     }
 
+    /// Add a member whose value is an array of already-rendered JSON objects,
+    /// one per line and indented under the member. An empty slice stays the
+    /// inline `[]` so a caller still sees the key. `search --json` uses it to
+    /// nest one object per day group.
+    pub(crate) fn objects(&mut self, name: &str, items: &[String]) -> &mut Self {
+        let rendered = if items.is_empty() {
+            "[]".to_string()
+        } else {
+            let body = items
+                .iter()
+                .map(|item| indent(item, 4))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            format!("[\n{body}\n  ]")
+        };
+        self.members.push((name.to_string(), rendered));
+        self
+    }
+
     /// Render the object, one member per line.
     pub(crate) fn finish(&self) -> String {
         if self.members.is_empty() {
@@ -188,6 +207,15 @@ fn task_array(tasks: &[Task]) -> String {
         .collect::<Vec<_>>()
         .join(",\n");
     format!("[\n{items}\n  ]")
+}
+
+/// Prefix every line of `text` with `spaces` spaces.
+fn indent(text: &str, spaces: usize) -> String {
+    let pad = " ".repeat(spaces);
+    text.split('\n')
+        .map(|line| format!("{pad}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -280,5 +308,44 @@ mod tests {
     #[test]
     fn empty_object_renders_as_empty_braces() {
         assert_eq!(JsonObject::new().finish(), "{}");
+    }
+
+    #[test]
+    fn renders_an_array_of_objects_member() {
+        let mut group = JsonObject::new();
+        group.text("day", "2026-10-10").tasks("tasks", &[task()]);
+        let mut object = JsonObject::new();
+        object
+            .text("query", "solo")
+            .objects("days", &[group.finish()]);
+        let expected = r#"{
+  "query": "solo",
+  "days": [
+    {
+      "day": "2026-10-10",
+      "tasks": [
+        {
+          "id": 7,
+          "day": "2026-10-10",
+          "title": "Solo",
+          "done": true,
+          "priority": "low",
+          "notes": "",
+          "due": null,
+          "tracked_secs": 0,
+          "tags": []
+        }
+      ]
+    }
+  ]
+}"#;
+        assert_eq!(object.finish(), expected);
+    }
+
+    #[test]
+    fn empty_objects_member_is_an_inline_array() {
+        let mut object = JsonObject::new();
+        object.objects("days", &[]);
+        assert_eq!(object.finish(), "{\n  \"days\": []\n}");
     }
 }

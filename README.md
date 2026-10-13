@@ -193,6 +193,8 @@ tasker update 3 --due ""                             # a blank --due clears the 
 tasker rm 4                                          # delete task 4
 tasker list                                          # print today's view (sections + rows)
 tasker search rent                                   # find tasks by title or notes across all days
+tasker search rent --json                            # those matches grouped by day, as an envelope
+tasker search -- --json                              # search for the literal text `--json`
 tasker list --json                                   # the four sections as an envelope
 tasker show 3                                        # print one task's detail
 tasker show 3 --json                                 # that task as a bare JSON object
@@ -205,17 +207,17 @@ tasker capabilities --json                           # report the contract + sch
 
 `add` captures a well-formed task in one call: `--day`, `--priority`, `--due`, `--tags`, and
 `--notes` are all optional, and an invalid `--due` or `--priority` is a usage error rather than a
-silent default. `add` and `update` titles may begin with dashes after a `--` terminator.
-`update` changes only the fields you pass and leaves every other field untouched, so a concurrent
-edit is not clobbered. Writes (`add`, `done`, `reopen`, `update`, `rm`) print a one-line
+silent default. `add` and `update` titles, and `search` queries, may begin with dashes after a `--`
+terminator. `update` changes only the fields you pass and leaves every other field untouched, so a
+concurrent edit is not clobbered. Writes (`add`, `done`, `reopen`, `update`, `rm`) print a one-line
 confirmation by default; `list` mirrors the TUI's Missed-due / Due-today / Overdue / Today
 sections; `search` groups matches by day; `export` writes to stdout so you can pipe it anywhere.
 
 Every command has a machine-readable form behind `--json`, with human text unchanged and the
-default. **Collections** (`list`, `tags`, `capabilities`) are wrapped in an envelope carrying the
-contract and schema versions around a `payload`; a **single Task is a bare JSON object**, not an
-envelope — that is `show` and every write command (`add`, `done`, `update`, `reopen`, `rm`), which
-emit the Task they produced or removed:
+default. **Collections** (`list`, `search`, `stats`, `tags`, `capabilities`) are wrapped in an
+envelope carrying the contract and schema versions around a `payload`; a **single Task is a bare
+JSON object**, not an envelope — that is `show` and every write command (`add`, `done`, `update`,
+`reopen`, `rm`), which emit the Task they produced or removed:
 
 ```json
 {
@@ -226,6 +228,29 @@ emit the Task they produced or removed:
     "due_today": [],
     "overdue": [],
     "today": []
+  }
+}
+```
+
+`search --json` groups its matches the way the interface does — one entry per day, in day order —
+and always carries the `days` array, so a query with no matches is a valid empty result rather than
+an error (a blank query is still a usage error and exits `2`):
+
+```json
+{
+  "contract": 1,
+  "schema": 2,
+  "payload": {
+    "query": "rent",
+    "days": [
+      {
+        "day": "2026-10-08",
+        "tasks": [
+          { "id": 4, "day": "2026-10-08", "title": "Pay the Rent", "done": false,
+            "priority": "medium", "notes": "", "due": null, "tracked_secs": 0, "tags": [] }
+        ]
+      }
+    ]
   }
 }
 ```
