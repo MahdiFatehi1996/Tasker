@@ -200,8 +200,12 @@ print usage and exit non-zero.
 | Database    | `%APPDATA%\tasker\tasks.db` (override: `--db`, `TASKER_DB`)                        |
 | Single task | id, day (`YYYY-MM-DD`), title, done, priority, notes, due, tracked seconds, tags   |
 | Schema      | Created on first launch; a version marker drives migrations (v1 → v2 adds due, tags, tracked seconds) |
+| Side-cars   | `tasks.db-wal` and `tasks.db-shm`: the write-ahead log; present alongside the database, copy them with it |
 
-Back up by copying the `.db` file.
+Back up by copying all three database files together: `tasks.db`, plus `tasks.db-wal` and
+`tasks.db-shm` when they exist. Tasker uses write-ahead logging, so the newest commits can live
+in those side-car files, and copying `tasks.db` alone can silently miss them. For a single
+self-contained snapshot, use `sqlite3 tasks.db "VACUUM INTO 'tasks-backup.db'"` instead.
 
 ## 🧱 Project layout
 
