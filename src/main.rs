@@ -25,7 +25,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(cli::exit_code(&Err(error)));
         }
     };
-    let database = Database::open(&resolve_db_path(db_arg))?;
+    let database = match Database::open(&resolve_db_path(db_arg)) {
+        Ok(database) => database,
+        Err(error) => {
+            let error = cli::CommandError::storage(error.to_string());
+            eprintln!("error: {error}");
+            std::process::exit(cli::exit_code(&Err(error)));
+        }
+    };
     match command {
         cli::Command::Tui => run_tui(&database),
         command => {

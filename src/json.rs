@@ -4,6 +4,8 @@
 //! It escapes a string, renders a single [`Task`] as an object, and renders a
 //! collection as an array. The whole-database `export --format json` dump is
 //! byte-for-byte what this writer produced when the helpers lived in `cli`.
+//! [`envelope`] wraps a payload with the Agent interface's contract and
+//! schema versions; the legacy export stays a bare top-level array.
 
 use crate::model::Task;
 
@@ -26,6 +28,28 @@ pub(crate) fn string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Render `values` as a single-line JSON array of strings.
+pub(crate) fn string_array(values: &[&str]) -> String {
+    let items = values
+        .iter()
+        .copied()
+        .map(string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
+/// Wrap a rendered `payload` in the Agent interface envelope: the interface
+/// `contract` version and the storage `schema` version around the body, so a
+/// caller can detect an incompatible Tasker before trusting the payload. The
+/// whole-database `export --format json` dump is deliberately *not* wrapped.
+pub(crate) fn envelope(contract: i64, schema: i64, payload: &str) -> String {
+    let indented = payload.replace('\n', "\n  ");
+    format!(
+        "{{\n  \"contract\": {contract},\n  \"schema\": {schema},\n  \"payload\": {indented}\n}}"
+    )
 }
 
 /// The internal JSON writer.

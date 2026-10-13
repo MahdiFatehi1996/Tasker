@@ -1,5 +1,5 @@
 //! Non-interactive command-line surface: `add` / `done` / `rm` / `list` /
-//! `export`.
+//! `export`, plus the Agent interface's `capabilities`.
 //!
 //! Shares the storage seam with the TUI — every command reads and writes
 //! through [`Database`], never SQLite directly, and resolves the database
@@ -66,15 +66,26 @@ fn storage(error: impl std::fmt::Display) -> CommandError {
     CommandError::storage(error.to_string())
 }
 
-/// Map a command outcome to its process exit code, preserving the contract
-/// exactly as it stands today: `0` success, `2` a usage (argument) error, and
-/// `1` any other command failure. Distinct codes for not-found and storage
-/// arrive with the Agent interface.
+/// The Agent interface contract version. Bumped when the shape of the
+/// machine-readable contract changes incompatibly; reported by `capabilities`.
+pub const CONTRACT_VERSION: i64 = 1;
+
+/// Map a command outcome to its process exit code. This is the documented
+/// exit-code table of the Agent interface, and it deliberately differs from
+/// the first CLI release (where not-found and storage both exited `1`):
+///
+/// | outcome         | code |
+/// | --------------- | ---- |
+/// | success         | 0    |
+/// | usage error     | 2    |
+/// | not found       | 3    |
+/// | storage failure | 4    |
 pub fn exit_code(outcome: &Result<String, CommandError>) -> i32 {
     match outcome {
         Ok(_) => 0,
         Err(CommandError::Usage(_)) => 2,
-        Err(CommandError::NotFound(_) | CommandError::Storage(_)) => 1,
+        Err(CommandError::NotFound(_)) => 3,
+        Err(CommandError::Storage(_)) => 4,
     }
 }
 
@@ -116,6 +127,12 @@ pub enum Command {
         /// Day to log (markdown only); defaults to today.
         day: Option<NaiveDate>,
     },
+    /// Report the Agent interface contract version and the storage schema
+    /// version, so a caller can detect an incompatible Tasker up front.
+    Capabilities {
+        /// Emit the machine-readable envelope instead of human text.
+        json: bool,
+    },
 }
 
 /// Usage banner printed on argument errors.
@@ -126,7 +143,9 @@ tasker done <id>                           mark a task done
 tasker rm <id>                             delete a task
 tasker list                                print today's view
 tasker export --format json|markdown       dump all tasks or log a day
-                [--day YYYY-MM-DD]         (markdown: day to log)";
+                [--day YYYY-MM-DD]         (markdown: day to log)
+tasker capabilities [--json]               report contract and schema versions
+exit codes: 0 success, 2 usage, 3 not found, 4 storage";
 
 /// Parse the process argument list (including `argv[0]`) into an optional
 /// explicit database path and a command. Extracts `--db <path>` /
@@ -186,6 +205,7 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
         },
         Some("list") => Ok(Command::List),
         Some("export") => parse_export(&positional[1..]),
+        Some("capabilities") => parse_capabilities(&positional[1..]),
         Some(other) => Err(CommandError::usage(format!("unknown command: {other}"))),
     }
 }
@@ -228,6 +248,22 @@ fn parse_export(rest: &[String]) -> Result<Command, CommandError> {
     Ok(Command::Export { format, day })
 }
 
+/// Parse `capabilities` options: no flags for human text, or `--json` for the
+/// machine-readable envelope.
+fn parse_capabilities(rest: &[String]) -> Result<Command, CommandError> {
+    let mut json = false;
+    for arg in rest {
+        if arg == "--json" {
+            json = true;
+        } else {
+            return Err(CommandError::usage(format!(
+                "unknown capabilities option: {arg}"
+            )));
+        }
+    }
+    Ok(Command::Capabilities { json })
+}
+
 fn parse_format(value: &str) -> Result<ExportFormat, CommandError> {
     match value {
         "json" => Ok(ExportFormat::Json),
@@ -253,6 +289,7 @@ pub fn execute(db: &Database, command: Command) -> Result<String, CommandError> 
         Command::Remove { id } => remove(db, id),
         Command::List => list(db),
         Command::Export { format, day } => export(db, format, day),
+        Command::Capabilities { json } => capabilities(json),
     }
 }
 
@@ -338,6 +375,24 @@ fn list_line(task: &Task) -> String {
     line
 }
 
+/// Commands the current contract version exposes, reported by `capabilities`.
+const COMMANDS: &[&str] = &["add", "capabilities", "done", "export", "list", "rm"];
+
+/// Report the Agent interface contract version and the storage schema version.
+/// Human text is the default; `--json` wraps the command inventory in the
+/// agent envelope carrying both versions.
+fn capabilities(json: bool) -> Result<String, CommandError> {
+    let schema = crate::db::SCHEMA_VERSION;
+    if json {
+        let payload = crate::json::string_array(COMMANDS);
+        Ok(crate::json::envelope(CONTRACT_VERSION, schema, &payload))
+    } else {
+        Ok(format!(
+            "Tasker agent interface\ncontract: {CONTRACT_VERSION}\nschema: {schema}"
+        ))
+    }
+}
+
 fn export(
     db: &Database,
     format: ExportFormat,
@@ -408,6 +463,185 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 10, 10).expect("valid date")
     }
 
+    /// Assert `text` is well-formed JSON. A deliberately small recursive
+    /// validator, independent of the production writer, so tests prove the
+    /// emitted bytes parse without adding a serialisation dependency.
+    fn assert_json_valid(text: &str) {
+        json_check(text).unwrap_or_else(|error| panic!("invalid JSON: {error}\n{text}"));
+    }
+
+    fn json_check(text: &str) -> Result<(), String> {
+        let mut parser = JsonCheck {
+            bytes: text.as_bytes(),
+            at: 0,
+        };
+        parser.value()?;
+        parser.space();
+        if parser.at == parser.bytes.len() {
+            Ok(())
+        } else {
+            Err(format!("trailing input at byte {}", parser.at))
+        }
+    }
+
+    /// Recursive-descent JSON grammar check (an RFC 8259 subset).
+    struct JsonCheck<'a> {
+        bytes: &'a [u8],
+        at: usize,
+    }
+
+    impl JsonCheck<'_> {
+        fn space(&mut self) {
+            while matches!(self.bytes.get(self.at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.at += 1;
+            }
+        }
+
+        fn value(&mut self) -> Result<(), String> {
+            self.space();
+            match self.bytes.get(self.at) {
+                Some(b'{') => self.object(),
+                Some(b'[') => self.array(),
+                Some(b'"') => self.string(),
+                Some(b't') => self.keyword("true"),
+                Some(b'f') => self.keyword("false"),
+                Some(b'n') => self.keyword("null"),
+                Some(b'-' | b'0'..=b'9') => self.number(),
+                other => Err(format!("unexpected {other:?} at byte {}", self.at)),
+            }
+        }
+
+        fn keyword(&mut self, word: &str) -> Result<(), String> {
+            if self.bytes[self.at..].starts_with(word.as_bytes()) {
+                self.at += word.len();
+                Ok(())
+            } else {
+                Err(format!("expected {word} at byte {}", self.at))
+            }
+        }
+
+        fn object(&mut self) -> Result<(), String> {
+            self.at += 1;
+            self.space();
+            if self.bytes.get(self.at) == Some(&b'}') {
+                self.at += 1;
+                return Ok(());
+            }
+            loop {
+                self.space();
+                self.string()?;
+                self.space();
+                if self.bytes.get(self.at) != Some(&b':') {
+                    return Err(format!("expected ':' at byte {}", self.at));
+                }
+                self.at += 1;
+                self.value()?;
+                self.space();
+                match self.bytes.get(self.at) {
+                    Some(b',') => self.at += 1,
+                    Some(b'}') => {
+                        self.at += 1;
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(format!(
+                            "expected ',' or '}}' at byte {}: {other:?}",
+                            self.at
+                        ));
+                    }
+                }
+            }
+        }
+
+        fn array(&mut self) -> Result<(), String> {
+            self.at += 1;
+            self.space();
+            if self.bytes.get(self.at) == Some(&b']') {
+                self.at += 1;
+                return Ok(());
+            }
+            loop {
+                self.value()?;
+                self.space();
+                match self.bytes.get(self.at) {
+                    Some(b',') => self.at += 1,
+                    Some(b']') => {
+                        self.at += 1;
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(format!(
+                            "expected ',' or ']' at byte {}: {other:?}",
+                            self.at
+                        ));
+                    }
+                }
+            }
+        }
+
+        fn string(&mut self) -> Result<(), String> {
+            if self.bytes.get(self.at) != Some(&b'"') {
+                return Err(format!("expected string at byte {}", self.at));
+            }
+            self.at += 1;
+            loop {
+                match self.bytes.get(self.at) {
+                    None => return Err("unterminated string".to_string()),
+                    Some(b'"') => {
+                        self.at += 1;
+                        return Ok(());
+                    }
+                    Some(b'\\') => {
+                        self.at += 1;
+                        match self.bytes.get(self.at) {
+                            Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                                self.at += 1;
+                            }
+                            Some(b'u') => {
+                                self.at += 1;
+                                for _ in 0..4 {
+                                    match self.bytes.get(self.at) {
+                                        Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') => {
+                                            self.at += 1;
+                                        }
+                                        _ => {
+                                            return Err(format!(
+                                                "bad \\u escape at byte {}",
+                                                self.at
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(format!("bad escape {other:?} at byte {}", self.at));
+                            }
+                        }
+                    }
+                    Some(_) => self.at += 1,
+                }
+            }
+        }
+
+        fn number(&mut self) -> Result<(), String> {
+            let start = self.at;
+            if self.bytes.get(self.at) == Some(&b'-') {
+                self.at += 1;
+            }
+            while matches!(
+                self.bytes.get(self.at),
+                Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+            ) {
+                self.at += 1;
+            }
+            let text = std::str::from_utf8(&self.bytes[start..self.at])
+                .map_err(|error| error.to_string())?;
+            text.parse::<f64>()
+                .map_err(|error| format!("bad number {text:?}: {error}"))?;
+            Ok(())
+        }
+    }
+
     #[test]
     fn bare_invocation_is_the_tui() {
         assert_eq!(parse_args(&args(&[])), Ok((None, Command::Tui)));
@@ -451,6 +685,19 @@ mod tests {
     #[test]
     fn list_parses() {
         assert_eq!(parse_args(&args(&["list"])), Ok((None, Command::List)));
+    }
+
+    #[test]
+    fn capabilities_parses_with_and_without_json() {
+        assert_eq!(
+            parse_args(&args(&["capabilities"])),
+            Ok((None, Command::Capabilities { json: false }))
+        );
+        assert_eq!(
+            parse_args(&args(&["capabilities", "--json"])),
+            Ok((None, Command::Capabilities { json: true }))
+        );
+        assert!(parse_args(&args(&["capabilities", "--nope"])).is_err());
     }
 
     #[test]
@@ -691,8 +938,8 @@ mod tests {
         assert!(matches!(&error, CommandError::NotFound(_)), "{error:?}");
         assert_eq!(
             exit_code(&Err(error)),
-            1,
-            "not-found keeps today's exit code"
+            3,
+            "not found exits 3 under the Agent interface contract"
         );
     }
 
@@ -728,11 +975,42 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_preserve_todays_contract() {
-        assert_eq!(exit_code(&Ok(String::new())), 0, "success stays 0");
+    fn capabilities_human_output_names_the_versions() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let text = execute(&db, Command::Capabilities { json: false }).expect("capabilities");
+        assert!(
+            text.contains(&format!("contract: {CONTRACT_VERSION}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("schema: {}", crate::db::SCHEMA_VERSION)),
+            "{text}"
+        );
+        assert!(!text.starts_with('{'), "human output is not JSON: {text}");
+    }
+
+    #[test]
+    fn capabilities_json_parses_and_reports_contract_and_schema() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let json = execute(&db, Command::Capabilities { json: true }).expect("capabilities");
+        assert_json_valid(&json);
+        assert!(
+            json.contains(&format!("\"contract\": {CONTRACT_VERSION}")),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!("\"schema\": {}", crate::db::SCHEMA_VERSION)),
+            "{json}"
+        );
+        assert!(json.contains("\"payload\""), "{json}");
+    }
+
+    #[test]
+    fn exit_codes_are_the_documented_contract() {
+        assert_eq!(exit_code(&Ok(String::new())), 0, "success is 0");
         assert_eq!(exit_code(&Err(CommandError::usage("bad args"))), 2);
-        assert_eq!(exit_code(&Err(CommandError::not_found("no task"))), 1);
-        assert_eq!(exit_code(&Err(CommandError::storage("disk full"))), 1);
+        assert_eq!(exit_code(&Err(CommandError::not_found("no task"))), 3);
+        assert_eq!(exit_code(&Err(CommandError::storage("disk full"))), 4);
     }
 
     #[test]
@@ -748,6 +1026,25 @@ mod tests {
         let db = seeded_db();
         let error = execute(&db, Command::Done { id: 9999 }).expect_err("no such task");
         assert!(matches!(error, CommandError::NotFound(_)), "{error:?}");
+    }
+
+    #[test]
+    fn json_export_is_a_bare_array_not_an_envelope() {
+        let db = seeded_db();
+        let json = execute(
+            &db,
+            Command::Export {
+                format: ExportFormat::Json,
+                day: None,
+            },
+        )
+        .expect("export json");
+        assert_json_valid(&json);
+        assert!(json.starts_with('['), "export stays a bare array: {json}");
+        assert!(
+            !json.contains("\"contract\""),
+            "export must not be wrapped in the agent envelope: {json}"
+        );
     }
 
     #[test]

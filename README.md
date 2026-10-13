@@ -184,14 +184,29 @@ A bare `tasker` launches the TUI; any subcommand runs non-interactively against 
 ```sh
 tasker add "Buy milk"                                # add a task to today
 tasker done 3                                        # mark task 3 done
+tasker rm 4                                          # delete task 4
 tasker list                                          # print today's view (sections + rows)
 tasker export --format json                          # full-fidelity dump: every field
 tasker export --format markdown --day 2026-10-08     # readable log of one day
+tasker capabilities --json                           # report the contract + schema versions
 ```
 
-`add` / `done` print a one-line confirmation; `list` mirrors the TUI's Missed-due / Due-today /
-Overdue / Today sections; `export` writes to stdout so you can pipe it anywhere. Argument errors
-print usage and exit non-zero.
+`add` / `done` / `rm` print a one-line confirmation; `list` mirrors the TUI's Missed-due /
+Due-today / Overdue / Today sections; `export` writes to stdout so you can pipe it anywhere.
+`capabilities` reports the Agent interface contract version and the storage schema version —
+human text by default, `--json` for the machine-readable envelope.
+
+Exit codes are part of the contract. A missing task and a storage failure are now distinct, so a
+caller can decide whether to correct its input or give up:
+
+| Code | Meaning         |
+| ---- | --------------- |
+| 0    | success         |
+| 2    | usage error     |
+| 3    | not found       |
+| 4    | storage failure |
+
+Argument errors print usage and exit `2`.
 
 ## 🗂️ Data and files
 
@@ -200,6 +215,7 @@ print usage and exit non-zero.
 | Database    | `%APPDATA%\tasker\tasks.db` (override: `--db`, `TASKER_DB`)                        |
 | Single task | id, day (`YYYY-MM-DD`), title, done, priority, notes, due, tracked seconds, tags   |
 | Schema      | Created on first launch; a version marker drives migrations (v1 → v2 adds due, tags, tracked seconds) |
+| Interface   | `tasker capabilities` reports the Agent interface contract version and the storage schema version |
 | Side-cars   | `tasks.db-wal` and `tasks.db-shm`: the write-ahead log; present alongside the database, copy them with it |
 
 Back up by copying all three database files together: `tasks.db`, plus `tasks.db-wal` and
