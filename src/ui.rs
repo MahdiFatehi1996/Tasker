@@ -3,9 +3,10 @@
 //! Rendering observes [`App`] read-only. Keys become [`Message`]s via the pure
 //! [`map_key`]; returned [`Effect`]s are performed against the
 //! [`Database`](crate::db::Database) and the viewed day reloads. Widget
-//! output is verified manually (headless frame capture); only the keymap
-//! has unit tests.
+//! output is asserted by headless frame-capture tests that render a frame and
+//! inspect the resulting buffer, alongside the keymap unit tests.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
@@ -458,34 +459,44 @@ fn section_count(sections: &[(Section, Vec<Task>)], wanted: Section) -> usize {
 }
 
 /// The Summary block: a read-out of the sections rendered beside it. Every
-/// The Summary block: a read-out of the sections rendered beside it. Every
 /// figure derives from `sections` — the single [`day_sections`] list the
 /// day-list column draws from — so the Summary can never disagree with the
-/// rows on screen. The Done fraction counts the primary sections (the viewed
+/// rows on screen. The per-section counts are per-section by definition, but
+/// the Task-level aggregates (tracked total and open high-Priority count)
+/// count each Task once, deduplicated by id, even when one Task is drawn in
+/// two sections. The Done fraction counts the primary sections (the viewed
 /// Day list, or Search's day groups), so it mirrors whichever view is active;
-/// the tracked total sums the live display of every rendered row, so a running
+/// the tracked total sums the live display of each unique row, so a running
 /// Timer's segment is included. The title names the active scope.
 fn summary_panel(
     app: &App,
     sections: &[(Section, Vec<Task>)],
     now: NaiveDateTime,
 ) -> Paragraph<'static> {
-    let primary = sections
-        .iter()
-        .filter(|(section, _)| section.is_primary())
-        .flat_map(|(_, rows)| rows.iter());
-    let done = primary.clone().filter(|task| task.done).count();
-    let total = primary.count();
-    let tracked: i64 = sections
+    let mut seen: HashSet<i64> = HashSet::new();
+    let unique: Vec<&Task> = sections
         .iter()
         .flat_map(|(_, rows)| rows.iter())
+        .filter(|task| seen.insert(task.id))
+        .collect();
+    let tracked: i64 = unique
+        .iter()
         .map(|task| app.tracked_display(task, now))
         .sum();
-    let high_open = sections
+    let high_open = unique
         .iter()
-        .flat_map(|(_, rows)| rows.iter())
         .filter(|task| !task.done && task.priority == Priority::High)
         .count();
+
+    let mut primary_seen: HashSet<i64> = HashSet::new();
+    let primary: Vec<&Task> = sections
+        .iter()
+        .filter(|(section, _)| section.is_primary())
+        .flat_map(|(_, rows)| rows.iter())
+        .filter(|task| primary_seen.insert(task.id))
+        .collect();
+    let done = primary.iter().filter(|task| task.done).count();
+    let total = primary.len();
 
     let title = match app.mode() {
         Mode::Search => format!("Summary — search: {}", app.search_query().trim()),
@@ -634,10 +645,7 @@ fn render(frame: &mut Frame, app: &App, today: NaiveDate, now: NaiveDateTime) {
             }
             (
                 Line::from(status),
-                Line::styled(
-                    "j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · / search · [ ] day · t today · Tab cal · ? help · q quit",
-                    theme::dim(),
-                ),
+                Line::styled(browse_hints(chunks[next].width), theme::dim()),
             )
         }
         Mode::Detail => (
@@ -707,6 +715,26 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+/// Browse-mode key hints sized to the column they are drawn in. The full line
+/// names every shortcut, but the status column is only `frame_width - 23`
+/// wide; a fixed line silently clips its tail (help and quit are the first
+/// casualties). So the longest line that fits is chosen, and the compact one
+/// always keeps the tail `? help · q quit` reachable at 80 columns. Lengths
+/// are compared in characters, matching how ratatui measures the buffer.
+fn browse_hints(width: u16) -> &'static str {
+    const FULL: &str = "j/k move · x toggle · d del · u undo · a add · e edit · w timer · f filter · / search · [ ] day · t today · Tab cal · ? help · q quit";
+    const WIDE: &str = "j/k move · x toggle · a add · e edit · w timer · f filter · [ ] day · t today · Tab cal · ? help · q quit";
+    const COMPACT: &str = "j/k move · x toggle · a add · w timer · ? help · q quit";
+    let width = usize::from(width);
+    if width >= FULL.chars().count() {
+        FULL
+    } else if width >= WIDE.chars().count() {
+        WIDE
+    } else {
+        COMPACT
+    }
 }
 
 /// Every keybinding in the app, grouped by context.
@@ -1222,9 +1250,16 @@ mod tests {
         }
     }
 
-    /// Render one frame headlessly and return the backing buffer.
+    /// Render one frame headlessly at the default 140-column test width and
+    /// return the backing buffer.
     fn render_frame(app: &App, now: NaiveDateTime) -> ratatui::buffer::Buffer {
-        let backend = ratatui::backend::TestBackend::new(140, 40);
+        render_frame_width(app, now, 140)
+    }
+
+    /// Render one frame headlessly at a given terminal width and return the
+    /// backing buffer.
+    fn render_frame_width(app: &App, now: NaiveDateTime, width: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| render(frame, app, now.date(), now))
@@ -1328,6 +1363,34 @@ mod tests {
     }
 
     #[test]
+    fn summary_counts_a_task_rendered_in_two_sections_once() {
+        let start = noon();
+        // One open, high-Priority task on a past day with a due moment before
+        // now: the interface draws it in both Missed Due and Overdue, so a
+        // naive sum over the rendered rows would count it twice.
+        let mut late = due_task(5, "late high");
+        late.priority = Priority::High;
+        late.day = day() - chrono::Duration::days(1);
+        late.tracked_secs = 600; // 0:10
+
+        let mut app = App::new(day(), vec![], vec![]);
+        app.set_missed_due(vec![late.clone()]);
+        app.set_overdue(vec![late]);
+
+        let text = buffer_text(&render_frame(&app, start));
+        assert!(text.contains("Missed due: 1"), "per-section count stays");
+        assert!(text.contains("Overdue: 1"), "per-section count stays");
+        assert!(
+            text.contains("High open: 1"),
+            "the shared task counts once:\n{text}"
+        );
+        assert!(
+            text.contains("Tracked: 0:10"),
+            "tracked time counts once:\n{text}"
+        );
+    }
+
+    #[test]
     fn summary_title_names_the_active_tag_filter() {
         let mut app = App::new(
             day(),
@@ -1360,6 +1423,28 @@ mod tests {
         assert!(!footer.contains("0/2"), "the fraction is gone");
         assert!(footer.contains("j/k move"), "keybinding hints stay");
         assert!(footer.contains("w timer"), "keybinding hints stay");
+    }
+
+    #[test]
+    fn footer_hints_fit_an_eighty_column_terminal() {
+        let text = buffer_text(&render_frame_width(&smoke_app(), noon(), 80));
+        let footer = footer_text(&text);
+
+        // At 80 columns the status column is only frame_width - 23 = 57 wide,
+        // so the hint line must shorten rather than clip. The tail is the
+        // first thing an over-long line loses, so assert it survives.
+        for hint in [
+            "j/k move",
+            "x toggle",
+            "a add",
+            "w timer",
+            "? help · q quit",
+        ] {
+            assert!(
+                footer.contains(hint),
+                "80-column footer keeps {hint:?} unclipped:\n{footer}"
+            );
+        }
     }
 
     #[test]

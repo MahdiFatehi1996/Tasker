@@ -13,6 +13,7 @@
 //! process entry point decides the exit code through the pure [`exit_code`]
 //! mapping instead of hard-coding it.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use chrono::{Local, NaiveDate};
@@ -282,7 +283,7 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
         None => Ok(Command::Tui),
         Some("add") => parse_add(&positional[1..]),
         Some("done") => {
-            let (id, json) = parse_id_and_json("done", &positional[1..])?;
+            let (id, json) = parse_legacy_id_and_json("done", &positional[1..])?;
             Ok(Command::Done { id, json })
         }
         Some("update") => parse_update(&positional[1..]),
@@ -294,9 +295,9 @@ fn parse_command(positional: &[String]) -> Result<Command, CommandError> {
             let (id, json) = parse_id_and_json("rm", &positional[1..])?;
             Ok(Command::Remove { id, json })
         }
-        Some("list") => {
-            parse_json_flag("list", &positional[1..]).map(|json| Command::List { json })
-        }
+        Some("list") => Ok(Command::List {
+            json: parse_legacy_json_flag(&positional[1..]),
+        }),
         Some("search") => parse_search(&positional[1..]),
         Some("show") => parse_show(&positional[1..]),
         Some("tags") => {
@@ -505,9 +506,9 @@ fn parse_update(rest: &[String]) -> Result<Command, CommandError> {
     })
 }
 
-/// Parse `<id> [--json]` for the single-id write commands (`done`, `reopen`,
+/// Parse `<id> [--json]` for the strict single-id write commands (`reopen`,
 /// `rm`). Exactly one numeric id, no stray arguments — the same convention
-/// `show` and `list` use.
+/// `show` uses.
 fn parse_id_and_json(command: &str, rest: &[String]) -> Result<(i64, bool), CommandError> {
     let mut id = None;
     let mut json = false;
@@ -549,6 +550,28 @@ fn parse_priority(value: &str) -> Result<Priority, CommandError> {
 fn parse_due(value: &str) -> Result<Option<chrono::NaiveDateTime>, CommandError> {
     parse_due_input(value)
         .ok_or_else(|| CommandError::usage(format!("invalid due: {value} (YYYY-MM-DD HH:MM)")))
+}
+
+/// Parse the option flags of a pre-existing command (`list`): `--json`
+/// selects the machine-readable form and every other argument is ignored.
+/// The machine-readable form is purely additive, so an invocation that
+/// predates it must not start failing; newer commands stay strict through
+/// [`parse_json_flag`].
+fn parse_legacy_json_flag(rest: &[String]) -> bool {
+    rest.iter().any(|arg| arg == "--json")
+}
+
+/// Parse `<id> [--json]` for the pre-existing `done` command: the first
+/// numeric argument is the id, `--json` selects machine output, and every
+/// other argument is ignored, matching the CLI before the Agent interface
+/// existed (a missing id is still a usage error). Newer commands stay strict
+/// through [`parse_id_and_json`].
+fn parse_legacy_id_and_json(command: &str, rest: &[String]) -> Result<(i64, bool), CommandError> {
+    let json = rest.iter().any(|arg| arg == "--json");
+    match rest.iter().find_map(|arg| arg.parse::<i64>().ok()) {
+        Some(id) => Ok((id, json)),
+        None => Err(CommandError::usage(format!("{command} needs a task id"))),
+    }
 }
 
 /// Parse a read command's only option: absent means human text, `--json`
@@ -726,35 +749,38 @@ fn done(db: &Database, id: i64, json: bool) -> Result<String, CommandError> {
     }
 }
 
-/// Change only the fields `fields` provides, leaving every other field as it
-/// was, then persist. An unknown id is a not-found error. `--json` emits the
-/// resulting task as a bare object.
+/// Change only the fields `fields` provides, leaving every other column
+/// untouched (a targeted write per field, never a read-modify-write of the
+/// whole Task, so a concurrent change is not clobbered). An unknown id is a
+/// not-found error. `--json` emits the resulting task as a bare object.
 fn update(
     db: &Database,
     id: i64,
     fields: UpdateFields,
     json: bool,
 ) -> Result<String, CommandError> {
-    let mut task = db
-        .task_by_id(id)
-        .map_err(storage)?
-        .ok_or_else(|| CommandError::not_found(format!("no task with id {id}")))?;
+    if db.task_by_id(id).map_err(storage)?.is_none() {
+        return Err(CommandError::not_found(format!("no task with id {id}")));
+    }
     if let Some(title) = fields.title {
-        task.title = title;
+        db.set_title(id, &title).map_err(storage)?;
     }
     if let Some(priority) = fields.priority {
-        task.priority = priority;
+        db.set_priority(id, priority).map_err(storage)?;
     }
     if let Some(due) = fields.due {
-        task.due = due;
+        db.set_due(id, due).map_err(storage)?;
     }
     if let Some(tags) = fields.tags {
-        task.tags = tags;
+        db.set_tags(id, &tags).map_err(storage)?;
     }
     if let Some(notes) = fields.notes {
-        task.notes = notes;
+        db.set_notes(id, &notes).map_err(storage)?;
     }
-    db.update_task(&task).map_err(storage)?;
+    let task = db
+        .task_by_id(id)
+        .map_err(storage)?
+        .ok_or_else(|| CommandError::storage("task missing after update"))?;
     if json {
         Ok(task_json(&task))
     } else {
@@ -903,6 +929,12 @@ fn tags(db: &Database, json: bool) -> Result<String, CommandError> {
 /// stored tracked seconds. Human text by default, the Agent envelope under
 /// `--json`.
 ///
+/// The per-section counts (Missed-due / Due-today / Overdue) are per-section
+/// by definition, but the Task-level aggregates — tracked time and the open
+/// high-Priority count — count each Task once, deduplicated by id, even when
+/// the same Task is rendered in two sections (a past-due Overdue task is also
+/// Missed-due).
+///
 /// Tracked time is *stored* seconds only. The live running-timer segment is
 /// in-memory TUI state that does not exist on the CLI, so a task being timed
 /// right now contributes its banked total, not the segment still ticking.
@@ -914,16 +946,19 @@ fn stats(db: &Database, json: bool) -> Result<String, CommandError> {
     let overdue = db.overdue_tasks(today).map_err(storage)?;
     let today_rows = db.tasks_for_day(today).map_err(storage)?;
 
-    let mut all: Vec<&Task> = Vec::new();
-    all.extend(&missed);
-    all.extend(&due);
-    all.extend(&overdue);
-    all.extend(&today_rows);
+    let mut seen: HashSet<i64> = HashSet::new();
+    let unique: Vec<&Task> = missed
+        .iter()
+        .chain(&due)
+        .chain(&overdue)
+        .chain(&today_rows)
+        .filter(|task| seen.insert(task.id))
+        .collect();
 
     let done = today_rows.iter().filter(|task| task.done).count() as i64;
     let total = today_rows.len() as i64;
-    let tracked_secs: i64 = all.iter().map(|task| task.tracked_secs.max(0)).sum();
-    let high_open = all
+    let tracked_secs: i64 = unique.iter().map(|task| task.tracked_secs.max(0)).sum();
+    let high_open = unique
         .iter()
         .filter(|task| !task.done && task.priority == Priority::High)
         .count() as i64;
@@ -1492,8 +1527,9 @@ mod tests {
 
     #[test]
     fn single_id_write_commands_accept_json_and_reject_extras() {
+        // `done` is a pre-existing command and stays tolerant (covered
+        // separately); the newer `reopen`/`rm` reject stray arguments.
         for (command, json) in [
-            ("done", Command::Done { id: 7, json: true }),
             ("reopen", Command::Reopen { id: 7, json: true }),
             ("rm", Command::Remove { id: 7, json: true }),
         ] {
@@ -1644,7 +1680,35 @@ mod tests {
             parse_args(&args(&["list", "--json"])),
             Ok((None, Command::List { json: true }))
         );
-        assert!(parse_args(&args(&["list", "--nope"])).is_err());
+        // A pre-existing command ignores unrecognised arguments rather than
+        // rejecting them, so `list foo` keeps working.
+        assert_eq!(
+            parse_args(&args(&["list", "foo", "bar"])),
+            Ok((None, Command::List { json: false }))
+        );
+        assert_eq!(
+            parse_args(&args(&["list", "foo", "--json"])),
+            Ok((None, Command::List { json: true }))
+        );
+    }
+
+    #[test]
+    fn legacy_list_and_done_tolerate_extra_arguments() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+
+        // `list foo` used to print the list and exit 0.
+        let (_, list_command) = parse_args(&args(&["list", "foo"])).expect("list tolerates foo");
+        assert_eq!(exit_code(&execute(&db, list_command)), 0);
+
+        // `done 1 2` used to mark task 1 done and exit 0.
+        db.save_task(&NewTask::dated(day(), "Done me".to_string()))
+            .expect("save");
+        let (_, done_command) = parse_args(&args(&["done", "1", "2"])).expect("done tolerates 2");
+        assert_eq!(exit_code(&execute(&db, done_command)), 0);
+        assert!(
+            db.task_by_id(1).expect("load").expect("exists").done,
+            "task 1 is marked done"
+        );
     }
 
     #[test]
@@ -2037,6 +2101,37 @@ mod tests {
         assert_eq!(after.notes, before.notes, "notes untouched");
         assert_eq!(after.day, before.day, "day untouched");
         assert_eq!(after.tracked_secs, before.tracked_secs);
+    }
+
+    #[test]
+    fn update_leaves_a_concurrent_change_intact() {
+        let db = seeded_db();
+        let id = db.all_tasks().expect("list")[0].id;
+
+        // A concurrent writer changes the title underneath between our read
+        // and our write; the update must not clobber it with a stale copy.
+        db.set_title(id, "Changed underneath")
+            .expect("concurrent title change");
+
+        execute(
+            &db,
+            Command::Update {
+                id,
+                fields: UpdateFields {
+                    notes: Some("my note".to_string()),
+                    ..UpdateFields::default()
+                },
+                json: false,
+            },
+        )
+        .expect("update notes");
+
+        let after = db.task_by_id(id).expect("load").expect("exists");
+        assert_eq!(after.notes, "my note");
+        assert_eq!(
+            after.title, "Changed underneath",
+            "the concurrent title change survives a partial update"
+        );
     }
 
     #[test]
@@ -2583,6 +2678,42 @@ mod tests {
         );
         assert!(text.contains("High open: 1"), "{text}");
         assert!(!text.starts_with('{'), "human output is not JSON: {text}");
+    }
+
+    #[test]
+    fn stats_counts_a_task_rendered_in_two_sections_once() {
+        let db = Database::open_in_memory().expect("open in-memory database");
+        let today = Local::now().date_naive();
+        // One open, high-Priority task on a past day with a due moment before
+        // now: it lands in both Missed-due and Overdue, so a naive sum over
+        // the rows would count it twice.
+        let due = (today - chrono::Duration::days(1))
+            .and_hms_opt(12, 0, 0)
+            .expect("valid datetime");
+        let id = db
+            .save_task(&NewTask {
+                day: today - chrono::Duration::days(1),
+                title: "Late and high".to_string(),
+                priority: Priority::High,
+                notes: String::new(),
+                due: Some(due),
+                tags: Vec::new(),
+            })
+            .expect("save");
+        db.add_tracked_secs(id, 3600).expect("bank an hour");
+
+        let json = execute(&db, Command::Stats { json: true }).expect("stats json");
+        assert_json_valid(&json);
+        assert!(json.contains("\"missed_due\": 1"), "{json}");
+        assert!(json.contains("\"overdue\": 1"), "{json}");
+        assert!(
+            json.contains("\"high_open\": 1"),
+            "the shared task counts once: {json}"
+        );
+        assert!(
+            json.contains("\"tracked_secs\": 3600"),
+            "tracked time counts once: {json}"
+        );
     }
 
     #[test]

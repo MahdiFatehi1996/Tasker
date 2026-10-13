@@ -1,8 +1,9 @@
 //! Tasker: a TUI daily task manager with a non-interactive CLI companion.
 //!
-//! Bare `tasker` launches the TUI; `add` / `done` / `rm` / `list` / `show` /
-//! `tags` / `stats` / `export` run against the same storage seam. See issues
-//! #8 and #13 for the Pro spec.
+//! Bare `tasker` launches the TUI; `add` / `done` / `reopen` / `update` /
+//! `rm` / `list` / `search` / `show` / `tags` / `stats` / `export` /
+//! `capabilities` run against the same storage seam. See issues #8 and #13
+//! for the Pro spec.
 
 mod app;
 mod cli;

@@ -449,15 +449,50 @@ impl Database {
         )
     }
 
-    /// Set (or clear with `None`) a task's due moment.
-    /// Wired into user flows by Pro P2; tests are the first caller.
-    #[allow(dead_code)]
+    /// Set (or clear with `None`) a task's due moment, touching no other
+    /// column. Backs `update --due` and the editor's due field.
     pub fn set_due(&self, task_id: i64, due: Option<NaiveDateTime>) -> Result<(), Error> {
         let due_text = due.as_ref().map(format_due);
         self.conn.execute(
             "UPDATE tasks SET due = ?1 WHERE id = ?2",
             rusqlite::params![due_text, task_id],
         )?;
+        Ok(())
+    }
+
+    /// Replace a task's title, leaving every other column untouched. A
+    /// targeted write so `update --title` cannot clobber a concurrent change
+    /// to any other field.
+    pub fn set_title(&self, task_id: i64, title: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE tasks SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a task's priority, leaving every other column untouched.
+    pub fn set_priority(&self, task_id: i64, priority: Priority) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE tasks SET priority = ?1 WHERE id = ?2",
+            rusqlite::params![priority.as_str(), task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a task's note body, leaving every other column untouched.
+    pub fn set_notes(&self, task_id: i64, notes: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE tasks SET notes = ?1 WHERE id = ?2",
+            rusqlite::params![notes, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a task's whole tag set (normalized, emptied when blank),
+    /// leaving the task's own columns untouched.
+    pub fn set_tags(&self, task_id: i64, tags: &[String]) -> Result<(), Error> {
+        sync_tags(&self.conn, task_id, tags)?;
         Ok(())
     }
 
@@ -892,6 +927,28 @@ mod tests {
         assert_eq!(tasks[0].due, Some(test_noon()));
         assert_eq!(tasks[0].tracked_secs, 90);
         assert_eq!(tasks[0].tags, vec!["work".to_string()]);
+    }
+
+    #[test]
+    fn targeted_setters_touch_only_their_column() {
+        let db = memory_db();
+        let id = db.save_task(&sample_task()).expect("save task");
+        let before = db.task_by_id(id).expect("load").expect("exists");
+
+        db.set_title(id, "Only the title").expect("set title");
+        db.set_notes(id, "Only the notes.").expect("set notes");
+        db.set_priority(id, Priority::Low).expect("set priority");
+        db.set_tags(id, &["work".to_string()]).expect("set tags");
+
+        let after = db.task_by_id(id).expect("load").expect("exists");
+        assert_eq!(after.title, "Only the title");
+        assert_eq!(after.notes, "Only the notes.");
+        assert_eq!(after.priority, Priority::Low);
+        assert_eq!(after.tags, vec!["work".to_string()]);
+        assert_eq!(after.due, before.due, "due untouched");
+        assert_eq!(after.done, before.done, "done untouched");
+        assert_eq!(after.tracked_secs, before.tracked_secs, "timer untouched");
+        assert_eq!(after.day, before.day, "day untouched");
     }
 
     #[test]

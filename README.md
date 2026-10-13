@@ -272,7 +272,10 @@ caller can decide whether to correct its input or give up:
 | 3    | not found       |
 | 4    | storage failure |
 
-Argument errors print usage and exit `2`.
+Argument errors print usage and exit `2`. The machine-readable `--json` forms were added without
+breaking existing invocations: the pre-existing commands (`list`, `done`) ignore any unrecognised
+arguments as they always did, while the newer commands (`show`, `tags`, `stats`, `rm`, `reopen`,
+`update`, `add`, `search`, `capabilities`) reject them.
 
 ## 🗂️ Data and files
 
@@ -297,6 +300,7 @@ src/
   cli.rs     Non-interactive surface: parse args → command; execute via storage
   app.rs     Pure state machine (messages → state + effects), unit-tested
   db.rs      SQLite storage seam (day queries, overdue, due, tags, timer)
+  json.rs    Hand-rolled JSON writer + Agent envelope for --json output
   model.rs   Domain types + formatting (tags, due input, H:MM totals)
   theme.rs   Single VS Code Dark Modern palette
   ui.rs      Ratatui render + event loop + keymap
