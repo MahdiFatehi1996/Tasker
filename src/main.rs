@@ -1,11 +1,12 @@
 //! Tasker: a TUI daily task manager with a non-interactive CLI companion.
 //!
-//! Bare `tasker` launches the TUI; `add` / `done` / `list` / `export` run
-//! against the same storage seam. See issues #8 and #13 for the Pro spec.
+//! Bare `tasker` launches the TUI; `add` / `done` / `rm` / `list` / `export`
+//! run against the same storage seam. See issues #8 and #13 for the Pro spec.
 
 mod app;
 mod cli;
 mod db;
+mod json;
 mod model;
 mod theme;
 mod ui;
@@ -18,27 +19,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let (db_arg, command) = match cli::parse_args(&args) {
         Ok(parsed) => parsed,
-        Err(message) => {
-            eprintln!("error: {message}");
+        Err(error) => {
+            eprintln!("error: {error}");
             eprintln!("{}", cli::USAGE);
-            std::process::exit(2);
+            std::process::exit(cli::exit_code(&Err(error)));
         }
     };
     let database = Database::open(&resolve_db_path(db_arg))?;
     match command {
         cli::Command::Tui => run_tui(&database),
-        command => match cli::execute(&database, command) {
-            Ok(output) => {
-                if !output.is_empty() {
-                    println!("{output}");
-                }
-                Ok(())
+        command => {
+            let outcome = cli::execute(&database, command);
+            if let Ok(output) = &outcome
+                && !output.is_empty()
+            {
+                println!("{output}");
             }
-            Err(message) => {
-                eprintln!("error: {message}");
-                std::process::exit(1);
+            if let Err(error) = &outcome {
+                eprintln!("error: {error}");
             }
-        },
+            std::process::exit(cli::exit_code(&outcome));
+        }
     }
 }
 
