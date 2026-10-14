@@ -155,18 +155,6 @@ Windows, `winget install MahdiFatehi1996.Tasker` is
 [in review](https://github.com/microsoft/winget-pkgs/pull/451584) for the Windows Package Manager
 community index, where it currently targets v0.3.2.
 
-For [MSYS2](https://www.msys2.org/), a `mingw-w64-ucrt-x86_64-tasker` package is
-[prepared in `packaging/msys2/`](packaging/msys2) and
-[under review](https://github.com/msys2/MINGW-packages/pull/32421) in
-`msys2/MINGW-packages`, where all five environments build it. Until it is accepted, build it
-from this repository:
-
-```sh
-cd packaging/msys2/mingw-w64-tasker
-MINGW_ARCH=ucrt64 makepkg-mingw -s
-pacman -U mingw-w64-ucrt-x86_64-tasker-*.pkg.tar.zst
-```
-
 Without a package manager:
 
 ```sh
