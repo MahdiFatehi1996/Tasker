@@ -153,11 +153,12 @@ brew install tasker
 Both install the matching prebuilt binary from the latest release and pin its checksum. On
 Windows, `winget install MahdiFatehi1996.Tasker` is
 [in review](https://github.com/microsoft/winget-pkgs/pull/451584) for the Windows Package Manager
-community index.
+community index, where it currently targets v0.3.2.
 
-For [MSYS2](https://www.msys2.org/), a `mingw-w64-ucrt-x86_64-tasker` package is prepared in
-[`packaging/msys2/`](packaging/msys2) and awaits submission to
-[`msys2/MINGW-packages`](https://github.com/msys2/MINGW-packages). Until it is accepted, build it
+For [MSYS2](https://www.msys2.org/), a `mingw-w64-ucrt-x86_64-tasker` package is
+[prepared in `packaging/msys2/`](packaging/msys2) and
+[under review](https://github.com/msys2/MINGW-packages/pull/32421) in
+`msys2/MINGW-packages`, where all five environments build it. Until it is accepted, build it
 from this repository:
 
 ```sh
