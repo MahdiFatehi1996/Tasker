@@ -116,6 +116,28 @@ Tagged releases publish prebuilt binaries for Windows, Linux, and macOS on the
 executable and an archive (`.tar.gz`, or `.zip` on Windows), and every release carries a
 `SHA256SUMS.txt` covering all of them plus a build provenance attestation.
 
+### Install script
+
+The same prebuilt binary, with no package manager in between:
+
+```sh
+# macOS and Linux
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/MahdiFatehi1996/Tasker/releases/latest/download/tasker-install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://github.com/MahdiFatehi1996/Tasker/releases/latest/download/tasker-install.ps1 | iex
+```
+
+Both resolve the latest release, check the archive against `SHA256SUMS.txt`, and unpack `tasker`
+into `~/.local/bin`. Pass `--version v0.3.2` to pin a release and `--dir <path>` to install
+elsewhere; when the script is piped into `Invoke-Expression` there is no way to pass parameters, so
+`TASKER_VERSION` and `TASKER_INSTALL_DIR` do the same job as environment variables. The shell
+script never edits your profile — it prints the `export PATH=...` line to add — while the PowerShell
+one puts the install directory on your user PATH if it is not already there.
+
 ### Package managers
 
 ```sh
@@ -132,6 +154,17 @@ Both install the matching prebuilt binary from the latest release and pin its ch
 Windows, `winget install MahdiFatehi1996.Tasker` is
 [in review](https://github.com/microsoft/winget-pkgs/pull/451584) for the Windows Package Manager
 community index.
+
+For [MSYS2](https://www.msys2.org/), a `mingw-w64-ucrt-x86_64-tasker` package is prepared in
+[`packaging/msys2/`](packaging/msys2) and awaits submission to
+[`msys2/MINGW-packages`](https://github.com/msys2/MINGW-packages). Until it is accepted, build it
+from this repository:
+
+```sh
+cd packaging/msys2/mingw-w64-tasker
+MINGW_ARCH=ucrt64 makepkg-mingw -s
+pacman -U mingw-w64-ucrt-x86_64-tasker-*.pkg.tar.zst
+```
 
 Without a package manager:
 
@@ -369,6 +402,9 @@ src/
   model.rs   Domain types + formatting (tags, due input, H:MM totals)
   theme.rs   Single VS Code Dark Modern palette
   ui.rs      Ratatui render + event loop + keymap
+packaging/
+  installer/ tasker-install.sh and tasker-install.ps1, shipped as release assets
+  msys2/     PKGBUILD for mingw-w64-ucrt-x86_64-tasker
 ```
 
 ## 🤝 Contributing

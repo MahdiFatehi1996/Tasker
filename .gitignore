@@ -1,5 +1,11 @@
 /target
 
+# MSYS2 package build output, produced by makepkg-mingw in packaging/msys2/*.
+packaging/msys2/*/src/
+packaging/msys2/*/pkg/
+packaging/msys2/*/*.pkg.tar.zst
+packaging/msys2/*/*.src.tar.zst
+
 # Local-only working notes and agent config (not published).
 /AGENTS.md
 /CONTEXT.md

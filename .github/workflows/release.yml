@@ -42,7 +42,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            rustflags: ""
+          - os: windows-latest
+            # Mirrors the release build so every push tests the binary that
+            # actually ships: a static CRT, which keeps the .exe from needing
+            # the Visual C++ Redistributable at runtime.
+            rustflags: "-C target-feature=+crt-static"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -52,9 +59,54 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo test --locked
+      - name: Shell installer parses (bash)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n packaging/installer/tasker-install.sh
+          echo "tasker-install.sh: bash -n OK"
+      # The script declares #!/usr/bin/env sh, so hold it to POSIX sh and not
+      # just to bash. Ubuntu's sh is dash, which is stricter than bash.
+      - name: Shell installer parses (POSIX sh)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n packaging/installer/tasker-install.sh
+          echo "tasker-install.sh: sh -n OK"
+      - name: PowerShell installer parses
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/packaging/installer/tasker-install.ps1",
+            [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { $_.ToString() }
+            exit 1
+          }
+          Write-Host "tasker-install.ps1: parse OK"
+      # Download the newest release for real: platform detection, checksum
+      # verification, extraction and install all have to work on this runner.
+      # On Ubuntu `sh` is dash, so this also executes the script as POSIX sh.
+      - name: Installer runs end to end
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$(mktemp -d)/bin"
+          sh packaging/installer/tasker-install.sh --dir "$target"
+          echo "--- installed ---"
+          ls -l "$target"
+          # `tasker` on POSIX, `tasker.exe` under Git Bash.
+          test -e "$target/tasker" || test -e "$target/tasker.exe"
 
   build:
     name: ${{ matrix.target }}
@@ -68,15 +120,21 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: .exe
+            # Static CRT: without it the shipped .exe imports VCRUNTIME140.dll
+            # and refuses to start on a Windows machine with no VC++ Redist.
+            rustflags: "-C target-feature=+crt-static"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: ""
+            rustflags: ""
           - os: macos-latest
             target: aarch64-apple-darwin
             ext: ""
+            rustflags: ""
           - os: macos-latest
             target: x86_64-apple-darwin
             ext: ""
+            rustflags: ""
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -86,6 +144,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage binary and archive
         shell: bash
@@ -121,10 +181,22 @@ jobs:
       id-token: write # sign the build provenance
       attestations: write # store the attestations
     steps:
+      # The installer scripts are not build outputs; take them from the tag so
+      # they land in dist/ alongside the binaries and get picked up by the
+      # `tasker-*` globs below (checksums + attestation).
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      - name: Stage installer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp packaging/installer/tasker-install.sh \
+             packaging/installer/tasker-install.ps1 \
+             dist/
+          ls -l dist
       - name: Checksums
         working-directory: dist
         run: |

@@ -9,7 +9,7 @@ homepage = "https://github.com/MahdiFatehi1996/Tasker"
 readme = "README.md"
 keywords = ["task", "todo", "tui", "terminal", "cli"]
 categories = ["command-line-utilities"]
-exclude = [".github/"]
+exclude = [".github/", "packaging/"]
 
 # The crate is published as `tasker-tui` (the obvious names are taken on
 # crates.io) but the binary it installs is still `tasker`.
