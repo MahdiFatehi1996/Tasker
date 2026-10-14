@@ -23,7 +23,7 @@ usage() {
 Usage: tasker-install.sh [options]
 
 Options:
-  --version <tag>  Install a specific release, e.g. --version v0.3.2.
+  --version <tag>  Install a specific release, e.g. --version v0.3.3.
                    Defaults to the latest release. TASKER_VERSION does the same.
   --dir <path>     Install into <path> instead of $DEFAULT_DIR.
                    TASKER_INSTALL_DIR does the same.

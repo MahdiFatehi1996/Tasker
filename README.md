@@ -132,7 +132,7 @@ irm https://github.com/MahdiFatehi1996/Tasker/releases/latest/download/tasker-in
 ```
 
 Both resolve the latest release, check the archive against `SHA256SUMS.txt`, and unpack `tasker`
-into `~/.local/bin`. Pass `--version v0.3.2` to pin a release and `--dir <path>` to install
+into `~/.local/bin`. Pass `--version v0.3.3` to pin a release and `--dir <path>` to install
 elsewhere; when the script is piped into `Invoke-Expression` there is no way to pass parameters, so
 `TASKER_VERSION` and `TASKER_INSTALL_DIR` do the same job as environment variables. The shell
 script never edits your profile — it prints the `export PATH=...` line to add — while the PowerShell

@@ -1,6 +1,6 @@
 [package]
 name = "tasker-tui"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "Offline, keyboard-driven daily task manager for the terminal: one task list per day, automatic carry-over, tags, a live timer, and a scriptable CLI."
 license = "MIT"

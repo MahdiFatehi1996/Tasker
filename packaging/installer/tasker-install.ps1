@@ -8,12 +8,12 @@
 #
 # Parameters work when the script is run as a file:
 #
-#   .\tasker-install.ps1 -Version v0.3.2 -Dir C:\tools
+#   .\tasker-install.ps1 -Version v0.3.3 -Dir C:\tools
 #
 # Piped into Invoke-Expression there is no way to pass them, so TASKER_VERSION
 # and TASKER_INSTALL_DIR override everything:
 #
-#   $env:TASKER_VERSION = 'v0.3.2'; irm .../tasker-install.ps1 | iex
+#   $env:TASKER_VERSION = 'v0.3.3'; irm .../tasker-install.ps1 | iex
 #
 param(
   [string]$Version = '',
@@ -34,7 +34,7 @@ param(
 Usage: tasker-install.ps1 [-Version <tag>] [-Dir <path>]
 
 Options:
-  -Version <tag>  Install a specific release, e.g. -Version v0.3.2.
+  -Version <tag>  Install a specific release, e.g. -Version v0.3.3.
                   Defaults to the latest release. `$env:TASKER_VERSION does the same.
   -Dir <path>     Install into <path> instead of $DefaultDir.
                   `$env:TASKER_INSTALL_DIR does the same.
